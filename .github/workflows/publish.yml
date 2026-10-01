@@ -1,0 +1,35 @@
+name: Publish release
+
+on:
+  push:
+    branches: [builds]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Release new zips
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          for zip in MiniAmp-miyoo-v*.zip; do
+            [ -f "$zip" ] || continue
+            v="${zip#MiniAmp-miyoo-v}"; v="${v%.zip}"; tag="v$v"
+            if gh release view "$tag" >/dev/null 2>&1; then
+              echo "$tag already released"; continue
+            fi
+            notes="notes-$tag.md"
+            [ -f "$notes" ] || { echo "::error::missing $notes"; exit 1; }
+            gh release create "$tag" "$zip" --target main \
+              --title "MiniAmp for Miyoo Mini Plus $tag" --notes-file "$notes"
+          done
