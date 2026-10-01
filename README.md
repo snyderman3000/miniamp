@@ -2,6 +2,8 @@
 
 A classic-skin music player for the **Miyoo Mini Plus** (OnionOS).
 
+![MiniAmp playing with the Graphite skin](docs/cover.png)
+
 - Plays MP3, FLAC, Ogg Vorbis and WAV (any sample rate, mono or stereo)
 - Loads classic `.wsz` skins; ships with an original skin, "Graphite"
 - Skin browser with live preview
@@ -14,6 +16,10 @@ MiniAmp is an independent project, written from scratch. It is not affiliated
 with Winamp, Nullsoft or Llama Group and contains no Winamp code or artwork.
 
 > **Built by Claude.** This player was written by Claude (Anthropic's AI) working with Keith Snyder.
+
+Skins from the classic era load as-is (shown here: the skin browser previewing a downloaded skin):
+
+![Skin browser](docs/skin-browser.png)
 
 ## Install
 
