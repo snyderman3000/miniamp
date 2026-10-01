@@ -1,0 +1,6 @@
+{
+  "label": "MiniAmp",
+  "icon": "icon.png",
+  "launch": "launch.sh",
+  "description": "Classic-skin music player"
+}
