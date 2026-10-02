@@ -1,0 +1,2 @@
+- **Music in games.** Turn on Options > Music in games, then quit MiniAmp while a song is playing: the music keeps going in the OnionOS menu, in games and in apps. Control it with SELECT + L/R (previous/next), SELECT + Up/Down (volume) and SELECT + START (pause). Opening MiniAmp picks up the same song. Turning the option off puts OnionOS's original sound library back; do that before deleting MiniAmp.
+- Fixed songs playing about 9% fast (slightly high-pitched): OnionOS's audio runs at 48 kHz, and MiniAmp now does too.
