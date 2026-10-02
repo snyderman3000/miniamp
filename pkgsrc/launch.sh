@@ -14,6 +14,7 @@ done
 echo "audio: LD_PRELOAD=${LD_PRELOAD:-none} audioserver=$(ps | grep -c [a]udioserver)" >> "$LOG"
 export LD_LIBRARY_PATH="$DIR/lib:/config/lib:/customer/lib:$LD_LIBRARY_PATH"
 export MA_HOME="$DIR"
+export MA_VERSION="$(cat "$DIR/VERSION" 2>/dev/null)"
 # performance numbers in log.txt every 10 seconds (comment out to silence)
 export MA_PROFILE=1
 

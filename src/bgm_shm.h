@@ -8,6 +8,7 @@
 #define BGM_MAGIC 0x4d414247u   // "GBAM"
 #define BGM_RING 16384          // stereo frames (power of two)
 #define BGM_RATE 48000
+#define BGM_WRAP_MARKER "MINIAMP_PADSP_WRAPPER_v1"
 
 typedef struct {
     uint32_t magic, version;
@@ -19,6 +20,7 @@ typedef struct {
     volatile int32_t paused;      // 1: hook mixes nothing
     volatile uint32_t underruns;  // hook wanted music but the ring was empty
     volatile uint32_t mixed_writes;
+    volatile int32_t dsp_pids[8];  // wrapped programs that have the sound device open
     char owner_name[32];
     int16_t ring[BGM_RING * 2];
 } bgm_shm;

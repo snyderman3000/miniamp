@@ -18,6 +18,7 @@
 
 #include "audio.h"
 #include "decode.h"
+#include "bgm_shm.h"
 
 const int EQ_FREQ[EQ_BANDS] = { 60, 170, 310, 600, 1000, 3000, 6000, 12000, 14000, 16000 };
 
@@ -70,7 +71,8 @@ static void wav_header(FILE *f, long data)
     unsigned v = (unsigned)(data + 36);
     h[4] = v; h[5] = v >> 8; h[6] = v >> 16; h[7] = v >> 24;
     memcpy(h + 8, "WAVEfmt ", 8);
-    unsigned char fmt[16] = { 16, 0, 0, 0, 1, 0, 2, 0, 0x44, 0xAC, 0, 0, 0x10, 0xB1, 2, 0 };
+    unsigned rate = OUT_RATE, br = OUT_RATE * 4;
+    unsigned char fmt[16] = { 16, 0, 0, 0, 1, 0, 2, 0, rate, rate >> 8, rate >> 16, 0, br, br >> 8, br >> 16, br >> 24 };
     memcpy(h + 16, fmt, 16);
     h[32] = 4; h[33] = 0; h[34] = 16; h[35] = 0;
     memcpy(h + 36, "data", 4);
@@ -103,8 +105,33 @@ static int out_open(void)
     return 1;
 }
 
+static bgm_shm *ring;
+
+static void ring_write(const int16_t *s, int frames)
+{
+    const uint32_t target = 6000;   // ~125 ms ahead of the mixer
+    int done = 0;
+    while (done < frames && running) {
+        uint32_t fill = ring->wpos - ring->rpos;
+        if (fill > BGM_RING) { ring->rpos = ring->wpos; fill = 0; }
+        if (fill >= target) { usleep(4000); continue; }
+        int n = (int)(target - fill);
+        if (n > frames - done) n = frames - done;
+        uint32_t w = ring->wpos;
+        for (int i = 0; i < n; i++) {
+            int16_t *o = &ring->ring[((w + i) & (BGM_RING - 1)) * 2];
+            o[0] = s[(done + i) * 2];
+            o[1] = s[(done + i) * 2 + 1];
+        }
+        __sync_synchronize();
+        ring->wpos = w + n;
+        done += n;
+    }
+}
+
 static void out_write(const int16_t *s, int frames)
 {
+    if (ring) { ring_write(s, frames); return; }
     if (dsp_fd >= 0) {
         const char *p = (const char *)s;
         size_t left = (size_t)frames * 4;
@@ -391,6 +418,16 @@ static void *audio_thread(void *arg)
 }
 
 // ---------------------------------------------------------------- API
+int audio_init_ring(void *shm)
+{
+    ring = shm;
+    out_latency = 0;
+    running = 1;
+    src_reset();
+    pthread_create(&thr, NULL, audio_thread, NULL);
+    return 1;
+}
+
 int audio_init(void)
 {
     int real = out_open();
@@ -434,6 +471,7 @@ void audio_set_paused(int paused)
     pthread_mutex_lock(&mtx);
     if (cmd_open) cmd_paused = paused;
     else if (st_state != A_STOPPED) st_state = paused ? A_PAUSED : A_PLAYING;
+    if (ring) ring->paused = paused;
     pthread_cond_broadcast(&cv);
     pthread_mutex_unlock(&mtx);
 }

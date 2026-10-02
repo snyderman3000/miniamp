@@ -29,6 +29,20 @@ Screen off: Options > Turn screen off. Music keeps playing; START pauses,
 L / R skip, any other button turns the screen back on. (The power button
 puts the whole handheld to sleep, which stops the music.)
 
+Music in games: Options > Music in games. With it on, quit MiniAmp while a
+song is playing and the music keeps going in the menu, in games and in other
+apps. While it plays in the background:
+  SELECT + L / R      previous / next song
+  SELECT + Up / Down  volume
+  SELECT + START      pause / resume
+Opening MiniAmp again picks up the same song. Apps that make their own sound
+some other way pause the music until you leave them.
+How it works: MiniAmp swaps OnionOS's sound library (miyoo/lib/libpadsp.so)
+for a version that blends the music into the sound of whatever is playing; the
+original is kept as libpadsp_orig.so. Turning the option off puts the original
+back - do that before deleting MiniAmp. If an OnionOS update replaces the file,
+MiniAmp sets it up again the next time the music goes to the background.
+
 Skins: copy classic .wsz skin files into MiniAmp/skins, then pick one in
 Options > Skin. Thousands are at https://skins.webamp.org.
 

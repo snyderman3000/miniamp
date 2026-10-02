@@ -3,11 +3,13 @@
 
 enum { A_STOPPED, A_PLAYING, A_PAUSED };
 
-#define OUT_RATE 44100
+#define OUT_RATE 48000   // OnionOS's audioserver plays at 48 kHz whatever rate is requested
 #define EQ_BANDS 10
 extern const int EQ_FREQ[EQ_BANDS];
 
 int audio_init(void);                 // returns 1 if a real output device is in use
+// background service: output goes to the shared music ring instead (bgm_shm.h)
+int audio_init_ring(void *shm);
 void audio_quit(void);
 
 // Commands are handled by the audio thread; they return immediately.

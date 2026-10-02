@@ -18,6 +18,8 @@
 #include "font.h"
 #include "vis.h"
 #include "playlist.h"
+#include "core.h"
+#include "gamemusic.h"
 
 #define SCREEN_W 640
 #define SCREEN_H 480
@@ -28,79 +30,6 @@ enum { K_UP = 103, K_DOWN = 108, K_LEFT = 105, K_RIGHT = 106, K_A = 57, K_B = 29
 
 enum { SCR_PLAYLIST, SCR_EQ, SCR_BROWSER, SCR_OPTIONS, SCR_SKINS, SCR_VIS, SCR_PRESETS };
 
-// ---------------------------------------------------------------- settings
-typedef struct {
-    int volume, balance;
-    int eq_on;
-    float eq_pre, eq[EQ_BANDS];
-    char eq_preset[40];
-    int shuffle, repeat;          // repeat: 0 off, 1 all, 2 one
-    int vis_mode;                 // main window: 1 spectrum, 2 scope, 0 off
-    int vis_preset;               // full screen
-    int remaining;
-    char skin[512];
-    char last_dir[1024];
-    int cur_index, cur_pos_ms;
-} settings;
-
-static settings S = { .volume = 80, .vis_mode = 1, .cur_index = -1 };
-static char app_dir[512], data_dir[512], root_dir[512];
-
-static void path_join(char *out, int n, const char *a, const char *b) { snprintf(out, n, "%s/%s", a, b); }
-
-static void settings_load(void)
-{
-    char p[1024];
-    path_join(p, sizeof p, data_dir, "settings.ini");
-    FILE *f = fopen(p, "r");
-    if (!f) return;
-    char line[1200];
-    while (fgets(line, sizeof line, f)) {
-        line[strcspn(line, "\r\n")] = 0;
-        char *eq = strchr(line, '=');
-        if (!eq) continue;
-        *eq = 0;
-        const char *k = line, *v = eq + 1;
-        if (!strcmp(k, "volume")) S.volume = atoi(v);
-        else if (!strcmp(k, "balance")) S.balance = atoi(v);
-        else if (!strcmp(k, "eq_on")) S.eq_on = atoi(v);
-        else if (!strcmp(k, "eq_pre")) S.eq_pre = (float)atof(v);
-        else if (!strcmp(k, "eq")) {
-            const char *p2 = v;
-            for (int i = 0; i < EQ_BANDS && *p2; i++) {
-                S.eq[i] = strtof(p2, (char **)&p2);
-                while (*p2 == ',' || *p2 == ' ') p2++;
-            }
-        }
-        else if (!strcmp(k, "eq_preset")) snprintf(S.eq_preset, sizeof S.eq_preset, "%s", v);
-        else if (!strcmp(k, "shuffle")) S.shuffle = atoi(v);
-        else if (!strcmp(k, "repeat")) S.repeat = atoi(v);
-        else if (!strcmp(k, "vis_mode")) S.vis_mode = atoi(v);
-        else if (!strcmp(k, "vis_preset")) S.vis_preset = atoi(v);
-        else if (!strcmp(k, "remaining")) S.remaining = atoi(v);
-        else if (!strcmp(k, "skin")) snprintf(S.skin, sizeof S.skin, "%s", v);
-        else if (!strcmp(k, "last_dir")) snprintf(S.last_dir, sizeof S.last_dir, "%s", v);
-        else if (!strcmp(k, "cur_index")) S.cur_index = atoi(v);
-        else if (!strcmp(k, "cur_pos_ms")) S.cur_pos_ms = atoi(v);
-    }
-    fclose(f);
-}
-
-static void settings_save(void)
-{
-    char p[1024], tmp[1100];
-    path_join(p, sizeof p, data_dir, "settings.ini");
-    snprintf(tmp, sizeof tmp, "%s.tmp", p);
-    FILE *f = fopen(tmp, "w");
-    if (!f) return;
-    fprintf(f, "volume=%d\nbalance=%d\neq_on=%d\neq_pre=%.1f\neq=", S.volume, S.balance, S.eq_on, S.eq_pre);
-    for (int i = 0; i < EQ_BANDS; i++) fprintf(f, "%s%.1f", i ? "," : "", S.eq[i]);
-    fprintf(f, "\neq_preset=%s\nshuffle=%d\nrepeat=%d\nvis_mode=%d\nvis_preset=%d\nremaining=%d\nskin=%s\nlast_dir=%s\ncur_index=%d\ncur_pos_ms=%d\n",
-            S.eq_preset, S.shuffle, S.repeat, S.vis_mode, S.vis_preset, S.remaining, S.skin, S.last_dir, S.cur_index, S.cur_pos_ms);
-    fclose(f);
-    rename(tmp, p);
-}
-
 // ---------------------------------------------------------------- state
 static m2d_surf *bb;
 static skin *sk_default, *sk;
@@ -110,7 +39,6 @@ static vis_data vd;
 static int screen = SCR_PLAYLIST, panel = SCR_PLAYLIST;  // panel: what sits under the main window
 static int quit;
 static double now_t;
-static int current = -1;      // playlist index being played
 static int sel, scroll;       // playlist cursor
 static int screen_off;
 static double sleep_at;       // 0 = no sleep timer
@@ -123,7 +51,6 @@ static double msg_until;
 static double marquee_t0;
 static char toast[160];
 static double toast_until;
-static int *shuffle_order, shuffle_n;
 static int has_dsp;
 static double last_save;
 static int playlist_dirty;
@@ -231,18 +158,6 @@ static void hint_bar(const hint *h, int n)
 }
 
 // ---------------------------------------------------------------- playback
-static void build_shuffle(void)
-{
-    int n = pl_count();
-    free(shuffle_order);
-    shuffle_order = malloc(sizeof(int) * (n ? n : 1));
-    shuffle_n = n;
-    for (int i = 0; i < n; i++) shuffle_order[i] = i;
-    for (int i = n - 1; i > 0; i--) { int j = rand() % (i + 1); int t = shuffle_order[i]; shuffle_order[i] = shuffle_order[j]; shuffle_order[j] = t; }
-    // current track first
-    for (int i = 0; i < n; i++) if (shuffle_order[i] == current) { shuffle_order[i] = shuffle_order[0]; shuffle_order[0] = current; break; }
-}
-
 static void update_marquee(void)
 {
     pl_item it;
@@ -257,57 +172,20 @@ static void update_marquee(void)
 
 static void play_index(int i, int start_ms, int paused)
 {
-    const char *p = pl_path(i);
-    if (!p) return;
-    current = i;
-    audio_play_file(p, start_ms, paused);
-    marquee_t0 = now_t;
-    S.cur_index = i;
-    if (S.shuffle && shuffle_n != pl_count()) build_shuffle();
-}
-
-static int next_index(int dir)
-{
-    int n = pl_count();
-    if (n == 0) return -1;
-    if (S.shuffle) {
-        if (shuffle_n != n) build_shuffle();
-        int k = 0;
-        for (int i = 0; i < n; i++) if (shuffle_order[i] == current) { k = i; break; }
-        k += dir;
-        if (k >= n) { if (!S.repeat) return -1; build_shuffle(); k = shuffle_order[0] == current && n > 1 ? 1 : 0; }
-        if (k < 0) k = 0;
-        return shuffle_order[k];
-    }
-    int k = current + dir;
-    if (k >= n) return S.repeat ? 0 : -1;
-    if (k < 0) return S.repeat ? n - 1 : 0;
-    return k;
+    if (core_play_index(i, start_ms, paused)) marquee_t0 = now_t;
 }
 
 static void skip(int dir)
 {
-    int k = next_index(dir);
-    if (dir < 0 && audio_pos_ms() > 3000 && current >= 0) k = current;   // "previous" restarts first
-    if (k < 0) return;
-    play_index(k, 0, 0);
-    sel = k;
+    int before = current;
+    core_skip(dir);
+    if (current != before || audio_pos_ms() < 1000) { sel = current; marquee_t0 = now_t; }
 }
 
-static void toggle_pause(void)
-{
-    int st = audio_state();
-    if (st == A_PLAYING) audio_set_paused(1);
-    else if (st == A_PAUSED) audio_set_paused(0);
-    else if (pl_count()) play_index(current >= 0 ? current : 0, 0, 0);
-}
-
-static void apply_audio_settings(void)
-{
-    audio_set_volume(S.volume);
-    audio_set_balance(S.balance);
-    audio_set_eq(S.eq_on, S.eq_pre, S.eq);
-}
+static void toggle_pause(void) { core_toggle_pause(); }
+static void apply_audio_settings(void) { core_apply_audio(); }
+static int next_index(int dir) { return core_next_index(dir); }
+static void build_shuffle(void) { core_build_shuffle(); }
 
 // ---------------------------------------------------------------- backlight
 static int bl_saved = -1;
@@ -552,7 +430,7 @@ static void pill(int right_x, int cy, const char *val, int on)
 }
 
 // ---------------------------------------------------------------- options
-enum { OPT_SCREEN, OPT_SHUFFLE, OPT_REPEAT, OPT_SLEEP, OPT_VOLUME, OPT_BALANCE, OPT_MINIVIS, OPT_TIME, OPT_SKIN, OPT_CLEAR, OPT_QUIT, OPT_N };
+enum { OPT_SCREEN, OPT_GAMEMUSIC, OPT_SHUFFLE, OPT_REPEAT, OPT_SLEEP, OPT_VOLUME, OPT_BALANCE, OPT_MINIVIS, OPT_TIME, OPT_SKIN, OPT_CLEAR, OPT_QUIT, OPT_N };
 static int opt_sel;
 static const int SLEEP_STEPS[] = { 0, 15, 30, 45, 60, 90, 120 };
 
@@ -561,6 +439,7 @@ static void opt_value(int i, char *out, int n, int *on)
     *on = 0;
     out[0] = 0;
     switch (i) {
+    case OPT_GAMEMUSIC: snprintf(out, n, "%s", S.game_music ? "On" : "Off"); *on = S.game_music; break;
     case OPT_SHUFFLE: snprintf(out, n, "%s", S.shuffle ? "On" : "Off"); *on = S.shuffle; break;
     case OPT_REPEAT: snprintf(out, n, "%s", S.repeat == 1 ? "All" : S.repeat == 2 ? "One" : "Off"); *on = S.repeat != 0; break;
     case OPT_SLEEP:
@@ -580,18 +459,19 @@ static void opt_value(int i, char *out, int n, int *on)
 
 static void draw_options(void)
 {
-    static const char *labels[OPT_N] = { "Turn screen off", "Shuffle", "Repeat", "Sleep timer", "Volume", "Balance",
+    static const char *labels[OPT_N] = { "Turn screen off", "Music in games", "Shuffle", "Repeat", "Sleep timer", "Volume", "Balance",
                                          "Mini visualizer", "Time display", "Skin", "Clear playlist", "Quit MiniAmp" };
-    const int x = 110, y = 14, w = 420, h = 424, rh = 32;
+    const int x = 110, y = 4, w = 420, h = 438, rh = 30;
     card(x, y, w, h, "OPTIONS");
     for (int i = 0; i < OPT_N; i++) {
-        int ry = y + 50 + i * (rh + 2);
+        int ry = y + 46 + i * (rh + 2);
         if (i == opt_sel) rrect(x + 12, ry, w - 24, rh, 8, C_SEL);
         font_draw_mid(bb, f_mid, x + 26, ry + rh / 2, labels[i], C_TEXT);
         char v[64];
         int on;
         opt_value(i, v, sizeof v, &on);
         if (i == OPT_SCREEN && i == opt_sel) font_draw_mid(bb, f_small, x + w - 26 - font_width(f_small, "START pauses · L/R skip"), ry + rh / 2, "START pauses · L/R skip", C_DIM);
+        if (i == OPT_GAMEMUSIC && i == opt_sel) font_draw_mid(bb, f_small, x + 160, ry + rh / 2, "keeps playing after Quit", C_DIM);
         if (v[0]) {
             char fv[64];
             font_fit(f_key, v, 170, fv, sizeof fv);
@@ -606,6 +486,17 @@ static void option_change(int dir, int activate)
 {
     switch (opt_sel) {
     case OPT_SCREEN: if (activate) { screen = panel; set_screen_off(1); } break;
+    case OPT_GAMEMUSIC:
+        if (!S.game_music) {
+            if (gm_install()) { S.game_music = 1; show_toast("%s", "On: quit while playing and the music keeps going"); }
+            else show_toast("%s", "Couldn't set up music in games (see log.txt)");
+        } else {
+            S.game_music = 0;
+            gm_uninstall();
+            show_toast("%s", "Music in games off");
+        }
+        settings_save();
+        break;
     case OPT_SHUFFLE: S.shuffle = !S.shuffle; if (S.shuffle) build_shuffle(); break;
     case OPT_REPEAT: S.repeat = (S.repeat + (dir < 0 ? 2 : 1)) % 3; break;
     case OPT_SLEEP: {
@@ -1181,7 +1072,7 @@ static void draw_frame(void)
     }
     if (toast_until > now_t) {
         int w = font_width(f_mid, toast) + 36;
-        int x = (SCREEN_W - w) / 2, y = screen == SCR_BROWSER ? 370 : 396;
+        int x = (SCREEN_W - w) / 2, y = screen == SCR_BROWSER ? 370 : screen == SCR_OPTIONS ? 443 : 396;
         rrect(x, y, w, 34, 17, 0xf0262b36u);
         font_draw_mid(bb, f_mid, x + 18, y + 17, toast, C_TEXT);
     }
@@ -1216,12 +1107,13 @@ int main(int argc, char **argv)
     const char *rd = getenv("MA_ROOT");
     snprintf(root_dir, sizeof root_dir, "%s", rd ? rd : dir_exists("/mnt/SDCARD") ? "/mnt/SDCARD" : (getenv("HOME") ? getenv("HOME") : "/"));
     if (strlen(root_dir) > 1 && root_dir[strlen(root_dir) - 1] == '/') root_dir[strlen(root_dir) - 1] = 0;
-    (void)argv;
+    if (argc > 1 && !strcmp(argv[1], "--service")) return service_main();
     srand((unsigned)time(NULL));
     signal(SIGTERM, on_signal);
     signal(SIGINT, on_signal);
     signal(SIGPIPE, SIG_IGN);
 
+    service_stop();          // the player takes over from the background service
     settings_load();
     if (m2d_init(SCREEN_W, SCREEN_H) != 0) { fprintf(stderr, "display init failed\n"); return 1; }
 
@@ -1258,7 +1150,9 @@ int main(int argc, char **argv)
     pl_load_m3u(p);
     if (S.cur_index >= 0 && S.cur_index < pl_count()) {
         sel = S.cur_index;
-        play_index(S.cur_index, S.cur_pos_ms, 1);   // resume where we left off, paused
+        // resume where we left off: playing if the background service was, else paused
+        play_index(S.cur_index, S.cur_pos_ms, !S.resume_playing);
+        S.resume_playing = 0;
     }
     if (S.shuffle) build_shuffle();
 
@@ -1355,9 +1249,14 @@ int main(int argc, char **argv)
         if (spent < target) usleep((useconds_t)((target - spent) * 1e6));
     }
     if (screen_off) set_screen_off(0);
+    int handoff = S.game_music && current >= 0 && audio_state() == A_PLAYING;
     save_all();
     audio_quit();
     pl_quit();
     m2d_quit();
+    if (handoff) {
+        if (!gm_installed()) gm_install();
+        service_spawn();
+    }
     return 0;
 }

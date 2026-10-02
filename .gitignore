@@ -2,3 +2,4 @@ build/
 pkg/
 dist/
 __pycache__/
+lib/libpadsp_wrap.so

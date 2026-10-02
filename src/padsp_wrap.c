@@ -24,7 +24,10 @@
 #include <sys/prctl.h>
 #include "bgm_shm.h"
 
-#define LOG_PATH "/mnt/SDCARD/App/GameMusicTest/hook.log"
+#define LOG_PATH "/mnt/SDCARD/App/MiniAmp/data/hook.log"
+
+// lets MiniAmp tell this wrapper apart from the original library
+__attribute__((used)) const char miniamp_wrapper_marker[] = BGM_WRAP_MARKER;
 
 static int (*r_open)(const char *, int, ...);
 static int (*r_openat)(int, const char *, int, ...);
@@ -54,7 +57,11 @@ static void logf_(const char *fmt, ...)
     if (n > (int)sizeof b - 1) n = sizeof b - 1;
     const char *lp = getenv("MA_HOOK_LOG");
     int fd = r_open ? r_open(lp ? lp : LOG_PATH, O_WRONLY | O_APPEND | O_CREAT, 0644) : -1;
-    if (fd >= 0) { r_write(fd, b, n); r_close(fd); }
+    if (fd >= 0) {
+        struct stat st;
+        if (fstat(fd, &st) == 0 && st.st_size < 65536) r_write(fd, b, n);
+        r_close(fd);
+    }
 }
 
 static void comm_name(char *out, int n)
@@ -131,6 +138,8 @@ __attribute__((constructor)) static void wrap_init(void)
 
 // ---------------------------------------------------------------- dsp tracking
 static int dsp_fd = -1, dsp_fmt = AFMT_S16_LE, dsp_ch = 2, dsp_rate = 0;
+static void map_shm_now(int force);
+static void slot_set(int on);
 static bgm_shm *shm;
 static uint32_t shm_try_ms;
 static int my_pid;
@@ -158,6 +167,8 @@ static void track_open(const char *path, int fd)
     char c[32];
     comm_name(c, sizeof c);
     logf_("[hook] %s[%d] opened %s (fd %d)\n", c, my_pid, path, fd);
+    map_shm_now(1);
+    slot_set(1);
 }
 
 int open(const char *path, int flags, ...)
@@ -207,12 +218,16 @@ int close(int fd)
     if (fd == dsp_fd && fd >= 0) {
         dsp_fd = -1;
         if (shm && shm->owner_pid == my_pid) shm->owner_pid = 0;
+        slot_set(0);
         logf_("[hook] pid %d closed the sound device\n", getpid());
     }
     return r_close(fd);
 }
 
-static void map_shm(void)
+static void map_shm_now(int force);
+static void map_shm(void) { map_shm_now(0); }
+
+static void map_shm_now(int force)
 {
     uint32_t t = now_ms();
     if (shm) {
@@ -220,7 +235,7 @@ static void map_shm(void)
         munmap(shm, sizeof *shm);   // service stopped
         shm = NULL;
     }
-    if (t - shm_try_ms < 1000) return;
+    if (!force && t - shm_try_ms < 1000) return;
     shm_try_ms = t;
     int fd = r_open(BGM_SHM_PATH, O_RDWR);
     if (fd < 0) return;
@@ -229,6 +244,21 @@ static void map_shm(void)
     if (p == MAP_FAILED) return;
     if (((bgm_shm *)p)->magic != BGM_MAGIC) { munmap(p, sizeof(bgm_shm)); return; }
     shm = p;
+}
+
+// records that this program has the sound device open (the service won't play directly meanwhile)
+static void slot_set(int on)
+{
+    if (!shm) return;
+    int pid = getpid();
+    for (int i = 0; i < 8; i++) {
+        if (on) {
+            if (shm->dsp_pids[i] == pid) return;
+            if (__sync_bool_compare_and_swap(&shm->dsp_pids[i], 0, pid)) return;
+        } else if (shm->dsp_pids[i] == pid) {
+            shm->dsp_pids[i] = 0;
+        }
+    }
 }
 
 static inline int16_t sat(int v) { return (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v); }

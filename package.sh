@@ -9,6 +9,7 @@ python3 skin/make_skin.py skins/Graphite.wsz
 OUT=pkg/App/MiniAmp
 rm -rf pkg && mkdir -p $OUT/lib $OUT/skins $OUT/fonts $OUT/licenses
 cp build/miniamp $OUT/
+cp build/libpadsp_wrap.so $OUT/lib/
 cp -L "$TC/arm-buildroot-linux-gnueabihf/sysroot/usr/lib/libz.so.1" $OUT/lib/
 "$TC/bin/arm-linux-gnueabihf-strip" $OUT/lib/libz.so.1
 cp skins/Graphite.wsz $OUT/skins/
