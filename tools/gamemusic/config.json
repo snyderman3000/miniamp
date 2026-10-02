@@ -1,0 +1,6 @@
+{
+  "label": "Game Music Test",
+  "icon": "icon.png",
+  "launch": "launch.sh",
+  "description": "Test: MiniAmp music during games"
+}
