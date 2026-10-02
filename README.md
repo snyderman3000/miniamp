@@ -37,6 +37,11 @@ that music into the program's own sound before it reaches the audioserver. The o
 library is kept as `libpadsp_orig.so` and restored when the option is turned off. See
 `src/padsp_wrap.c` and `src/gamemusic.c`.
 
+**Uninstalling.** Erasing MiniAmp in [Mixtape](https://github.com/snyderman3000/mixtape)
+(0.1.5 or later) runs `mixtape-uninstall.sh` first, which stops the background music and
+puts the original library back. If you delete the folder by hand, turn Music in games off
+first, or run `App/MiniAmp/mixtape-uninstall.sh` yourself.
+
 ## Building
 
 See [docs/BUILDING.md](docs/BUILDING.md).

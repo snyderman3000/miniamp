@@ -20,6 +20,7 @@
 #include "playlist.h"
 #include "core.h"
 #include "gamemusic.h"
+#include "bgm_shm.h"
 
 #define SCREEN_W 640
 #define SCREEN_H 480
@@ -1108,6 +1109,14 @@ int main(int argc, char **argv)
     snprintf(root_dir, sizeof root_dir, "%s", rd ? rd : dir_exists("/mnt/SDCARD") ? "/mnt/SDCARD" : (getenv("HOME") ? getenv("HOME") : "/"));
     if (strlen(root_dir) > 1 && root_dir[strlen(root_dir) - 1] == '/') root_dir[strlen(root_dir) - 1] = 0;
     if (argc > 1 && !strcmp(argv[1], "--service")) return service_main();
+    if (argc > 1 && !strcmp(argv[1], "--uninstall")) {
+        // undo everything outside the app folder (run by Mixtape before it erases MiniAmp)
+        service_stop();
+        int ok = gm_uninstall();
+        unlink(BGM_SHM_PATH);
+        fprintf(stderr, "uninstall: Onion's sound library %s\n", ok ? "is the original" : "could NOT be restored");
+        return ok ? 0 : 1;
+    }
     srand((unsigned)time(NULL));
     signal(SIGTERM, on_signal);
     signal(SIGINT, on_signal);
