@@ -16,6 +16,7 @@
 #include <sched.h>
 #include <ctype.h>
 #include "decode.h"
+#define OUT 48000
 
 // ---- diagnostics: which processes use the CPU, and scheduling experiments
 typedef struct { int pid; long ticks; char comm[32]; } pinfo;
@@ -211,7 +212,7 @@ int main(int argc, char **argv)
     const char *dp = getenv("BG_DSP");
     int dsp = open(dp ? dp : "/dev/dsp", O_WRONLY | (dp ? O_CREAT | O_TRUNC : 0), 0644);
     if (dsp < 0) { perror("[bg] open /dev/dsp"); return 1; }
-    int frag = (4 << 16) | 12, fmt = AFMT_S16_LE, ch = 2, rate = 44100;
+    int frag = (4 << 16) | 12, fmt = AFMT_S16_LE, ch = 2, rate = OUT;
     ioctl(dsp, SNDCTL_DSP_SETFRAGMENT, &frag);
     ioctl(dsp, SNDCTL_DSP_SETFMT, &fmt);
     ioctl(dsp, SNDCTL_DSP_CHANNELS, &ch);
@@ -221,8 +222,25 @@ int main(int argc, char **argv)
     static float in[4096 * 2];
     static short out[8192 * 2];
     double t0 = now(), t_log = t0, worst = 0;
-    int chunk = 4096, phase = 1;
-    printf("[bg] phase 1 (0-20s): 4096-frame writes, normal priority\n");
+    int chunk = 1024;
+    {
+        struct sched_param sp = { .sched_priority = 10 };
+        int r = sched_setscheduler(0, SCHED_RR, &sp);
+        printf("[bg] test 3: 48 kHz output, 1024-frame writes, realtime priority for this player (%s); audioserver untouched\n", r == 0 ? "ok" : "FAILED");
+    }
+    {
+        static const char *cfgs[] = { "/mnt/SDCARD/RetroArch/.retroarch/retroarch.cfg", "/mnt/SDCARD/RetroArch/retroarch.cfg", NULL };
+        for (int i = 0; cfgs[i]; i++) {
+            FILE *f = fopen(cfgs[i], "r");
+            if (!f) continue;
+            char line[256];
+            printf("[bg] %s:\n", cfgs[i]);
+            while (fgets(line, sizeof line, f))
+                if (!strncmp(line, "audio_", 6)) printf("     %s", line);
+            fclose(f);
+            break;
+        }
+    }
     top_procs(0);
     long long frames = 0, frames_log = 0;
     long cpu0 = cpu_ticks();
@@ -233,7 +251,7 @@ int main(int argc, char **argv)
         decoder *d = dec_open(tracks[ti], &info);
         if (!d) { printf("[bg] cannot open %s\n", tracks[ti]); if (++errors > 20) break; continue; }
         printf("[bg] playing %s (%d Hz, %d ch)\n", tracks[ti], info.samplerate, info.channels);
-        double pos = 0, step = (double)info.samplerate / 44100;
+        double pos = 0, step = (double)info.samplerate / OUT;
         int have = 0, idx = 0, nch = info.channels;
         float cur[2], nxt[2];
 #define GET(f) ( (idx < have || ((have = dec_read(d, in, 4096)) > 0 && ((idx = 0), 1))) \
@@ -269,21 +287,10 @@ int main(int argc, char **argv)
                 frames += n;
             }
             double t = now();
-            if (phase == 1 && t - t0 >= 20) {
-                phase = 2; chunk = 1024;
-                struct sched_param sp = { .sched_priority = 10 };
-                int r = sched_setscheduler(0, SCHED_RR, &sp);
-                printf("[bg] phase 2 (20-40s): 1024-frame writes, realtime priority for this player: %s\n", r == 0 ? "ok" : "FAILED");
-            }
-            if (phase == 2 && t - t0 >= 40) {
-                phase = 3;
-                printf("[bg] phase 3 (40s on): also realtime priority for audioserver\n");
-                boost_audioserver();
-            }
             if (t - t_log >= 5) {
                 long cpu = cpu_ticks();
                 printf("[bg] %.0fs: %.0f%% of real time, longest write %.0f ms, cpu %.0f%%, errors %d\n",
-                       t - t0, (frames - frames_log) / 44100.0 / (t - t_log) * 100, worst * 1000,
+                       t - t0, (frames - frames_log) / (double)OUT / (t - t_log) * 100, worst * 1000,
                        (cpu - cpu0) / hz / (t - t_log) * 100, errors);
                 top_procs(t - t_log);
                 frames_log = frames; t_log = t; worst = 0; cpu0 = cpu;
