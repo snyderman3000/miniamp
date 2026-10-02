@@ -1,0 +1,6 @@
+{
+  "label": "BG Music Test",
+  "icon": "icon.png",
+  "launch": "launch.sh",
+  "description": "Test: music in the background during games"
+}
