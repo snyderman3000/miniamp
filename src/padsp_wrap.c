@@ -320,3 +320,121 @@ ssize_t write(int fd, const void *buf, size_t n)
     }
     return total;
 }
+
+// ---------------------------------------------------------------- straight to the audio chip (MI_AO)
+// Many ports stop OnionOS's audioserver and play through the chip's own
+// library (libmi_ao.so), as steward-fu's Miyoo SDL2 does: MI_AO_SetPubAttr
+// sets the rate, then MI_AO_SendFrame hands over each block of 16-bit
+// interleaved samples. Their sound never goes near /dev/dsp, so the music is
+// mixed in here instead. These replace the library's functions in programs
+// that use it and forward to the real ones; other programs never call them.
+//
+// Off switch: an empty file App/MiniAmp/data/no_chip_hook.
+
+typedef int MI_S32;
+typedef struct {                 // MI_AUDIO_Attr_t (mi_aio_datatype.h), leading fields
+    int eSamplerate, eBitwidth, eWorkmode, eSoundmode;
+    uint32_t u32FrmNum, u32PtNumPerFrm, u32CodecChnCnt, u32ChnCnt;
+} ma_ao_attr;
+typedef struct {                 // MI_AUDIO_Frame_t, whole (copied by value)
+    int eBitwidth, eSoundmode;
+    void *apVirAddr[16];
+    uint64_t u64TimeStamp;
+    uint32_t u32Seq, u32Len, au32PoolId[2];
+    void *apSrcPcmVirAddr[16];
+    uint32_t u32SrcPcmLen;
+} ma_ao_frame;
+#if defined(__arm__)
+_Static_assert(sizeof(ma_ao_frame) == 168, "MI_AUDIO_Frame_t layout");
+#endif
+
+static MI_S32 (*r_ao_setattr)(int, ma_ao_attr *);
+static MI_S32 (*r_ao_send)(int, int, ma_ao_frame *, MI_S32);
+static MI_S32 (*r_ao_disable)(int);
+static int ao_rate, ao_on = -1;
+static uint32_t ao_frac;
+static int16_t *ao_buf;
+static size_t ao_cap;
+
+// whether to mix into this program's chip audio (checked once)
+static int ao_enabled(void)
+{
+    if (ao_on >= 0) return ao_on;
+    char c[32];
+    comm_name(c, sizeof c);
+    ao_on = strncmp(c, "audioserver", 11) != 0 &&      // it already gets the music through /dev/dsp
+            access("/mnt/SDCARD/App/MiniAmp/data/no_chip_hook", F_OK) != 0;
+    return ao_on;
+}
+
+MI_S32 MI_AO_SetPubAttr(int dev, ma_ao_attr *attr)
+{
+    if (!r_ao_setattr) r_ao_setattr = dlsym(RTLD_NEXT, "MI_AO_SetPubAttr");
+    if (!r_ao_setattr) return -1;
+    MI_S32 r = r_ao_setattr(dev, attr);
+    if (r == 0 && attr && ao_enabled()) {
+        ao_rate = attr->eSamplerate;
+        ao_frac = 0;
+        my_pid = getpid();
+        char c[32];
+        comm_name(c, sizeof c);
+        logf_("[hook] %s[%d] plays straight to the audio chip: %d Hz, %s, %d bit\n", c, my_pid, ao_rate,
+              attr->eSoundmode == 1 ? "stereo" : "mono", attr->eBitwidth == 0 ? 16 : 24);
+        map_shm_now(1);
+        slot_set(1);
+    }
+    return r;
+}
+
+MI_S32 MI_AO_Disable(int dev)
+{
+    if (!r_ao_disable) r_ao_disable = dlsym(RTLD_NEXT, "MI_AO_Disable");
+    if (ao_rate) {
+        ao_rate = 0;
+        if (shm && shm->owner_pid == my_pid) shm->owner_pid = 0;
+        if (dsp_fd < 0) slot_set(0);
+        logf_("[hook] pid %d stopped using the audio chip\n", getpid());
+    }
+    return r_ao_disable ? r_ao_disable(dev) : -1;
+}
+
+MI_S32 MI_AO_SendFrame(int dev, int chn, ma_ao_frame *f, MI_S32 ms)
+{
+    if (!r_ao_send) r_ao_send = dlsym(RTLD_NEXT, "MI_AO_SendFrame");
+    if (!r_ao_send) return -1;
+    int ch = f && f->eSoundmode == 1 ? 2 : 1;
+    if (!f || !ao_rate || dsp_fd >= 0 || f->eBitwidth != 0 || !f->apVirAddr[0] || f->u32Len < 4 || f->eSoundmode > 1)
+        return r_ao_send(dev, chn, f, ms);
+    map_shm();
+    if (!shm || shm->paused) return r_ao_send(dev, chn, f, ms);
+    uint32_t t = now_ms();
+    if (shm->owner_pid != my_pid) {
+        if (shm->owner_pid != 0 && t - shm->owner_ms < 300) return r_ao_send(dev, chn, f, ms);
+        shm->owner_pid = my_pid;
+        comm_name((char *)shm->owner_name, sizeof shm->owner_name);
+    }
+    shm->owner_ms = t;
+
+    size_t frames = f->u32Len / (2 * (size_t)ch);
+    if (frames * ch > ao_cap) {
+        int16_t *nb = realloc(ao_buf, frames * ch * 2);
+        if (!nb) return r_ao_send(dev, chn, f, ms);
+        ao_buf = nb;
+        ao_cap = frames * ch;
+    }
+    uint32_t step = bgm_step(ao_rate, BGM_RATE);
+    uint32_t r0 = shm->rpos, avail = shm->wpos - r0;
+    if (avail > BGM_RING) avail = 0;
+    __sync_synchronize();
+    int under = 0;
+    bgm_mix(ao_buf, f->apVirAddr[0], frames, ch, shm->ring, BGM_RING - 1, r0, avail, ao_frac, step, shm->volume, &under);
+    if (under) shm->underruns++;
+    ma_ao_frame mine = *f;      // the program's own buffer is left untouched
+    mine.apVirAddr[0] = ao_buf;
+    MI_S32 r = r_ao_send(dev, chn, &mine, ms);
+    if (r == 0) {               // accepted: the music moves on with it
+        shm->rpos = r0 + bgm_advance(frames, ao_frac, step, avail, &ao_frac);
+        shm->mixed_writes++;
+    }
+    return r;
+}
