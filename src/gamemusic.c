@@ -76,6 +76,22 @@ static int copy_atomic(const char *src, const char *dst)
     return 1;
 }
 
+// same_file: identical contents (an update replaces the wrapper even if its size didn't change)
+static int same_file(const char *a, const char *b)
+{
+    FILE *fa = fopen(a, "rb"), *fb = fopen(b, "rb");
+    int same = fa && fb;
+    char x[4096], y[4096];
+    while (same) {
+        size_t na = fread(x, 1, sizeof x, fa), nb = fread(y, 1, sizeof y, fb);
+        if (na != nb || memcmp(x, y, na)) same = 0;
+        else if (na == 0) break;
+    }
+    if (fa) fclose(fa);
+    if (fb) fclose(fb);
+    return same;
+}
+
 int gm_installed(void)
 {
     char cur[600];
@@ -100,11 +116,7 @@ int gm_install(void)
             return 0;
         }
     }
-    if (exists(cur) && has_marker(cur)) {
-        // already ours: only refresh if the bundled wrapper differs in size
-        struct stat a, b;
-        if (stat(cur, &a) == 0 && stat(wrap, &b) == 0 && a.st_size == b.st_size) return 1;
-    }
+    if (exists(cur) && has_marker(cur) && same_file(cur, wrap)) return 1;   // already this version
     int ok = copy_atomic(wrap, cur);
     sync();
     fprintf(stderr, "[gm] wrapper %s\n", ok ? "installed" : "install FAILED");
