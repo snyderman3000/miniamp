@@ -1,0 +1,5 @@
+- **Fixed: music in games playing too slow in some games.** The music was mixed in at its own speed whatever rate the game played at, so it ran slow and low in Mario 64 (32 kHz), Balatro (44.1 kHz), Petals Around the Rose (22.05 kHz) and the video player. It's now converted to each game's rate.
+- **Music in more ports.** Ports that switch off OnionOS's sound service and play straight to the audio chip (`KillAudioserver=1`, with steward-fu's Miyoo SDL2) now get the music mixed in there too. If a port misbehaves with it, create an empty file `App/MiniAmp/data/no_chip_hook` to turn just that part off.
+- A port that switches the sound service off but makes no sound of its own still stops the music, because there's nothing to mix into. Changing `KillAudioserver=1` to `KillAudioserver=0` in its `.port` file (in `Roms/PORTS/Shortcuts`) keeps the music going.
+- `hook.log` now starts over (keeping the previous one as `hook.log.1`) instead of stopping at 64 KB.
+- MiniAmp now refreshes its installed sound wrapper whenever the wrapper changes, not only when its size does.
