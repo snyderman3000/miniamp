@@ -23,6 +23,7 @@
 #include <sys/stat.h>
 #include <sys/prctl.h>
 #include "bgm_shm.h"
+#include "bgm_mix.h"
 
 #define LOG_PATH "/mnt/SDCARD/App/MiniAmp/data/hook.log"
 
@@ -56,10 +57,17 @@ static void logf_(const char *fmt, ...)
     if (n <= 0) return;
     if (n > (int)sizeof b - 1) n = sizeof b - 1;
     const char *lp = getenv("MA_HOOK_LOG");
-    int fd = r_open ? r_open(lp ? lp : LOG_PATH, O_WRONLY | O_APPEND | O_CREAT, 0644) : -1;
+    const char *path = lp ? lp : LOG_PATH;
+    // Keep the log small: once it's 64 KB, it becomes hook.log.1 and a new one starts.
+    struct stat st;
+    if (stat(path, &st) == 0 && st.st_size >= 65536) {
+        char old[300];
+        snprintf(old, sizeof old, "%s.1", path);
+        rename(path, old);
+    }
+    int fd = r_open ? r_open(path, O_WRONLY | O_APPEND | O_CREAT, 0644) : -1;
     if (fd >= 0) {
-        struct stat st;
-        if (fstat(fd, &st) == 0 && st.st_size < 65536) r_write(fd, b, n);
+        r_write(fd, b, n);
         r_close(fd);
     }
 }
@@ -138,6 +146,7 @@ __attribute__((constructor)) static void wrap_init(void)
 
 // ---------------------------------------------------------------- dsp tracking
 static int dsp_fd = -1, dsp_fmt = AFMT_S16_LE, dsp_ch = 2, dsp_rate = 0;
+static uint32_t music_frac;   // position between two music frames (16.16), for resampling
 static void map_shm_now(int force);
 static void slot_set(int on);
 static bgm_shm *shm;
@@ -163,6 +172,7 @@ static void track_open(const char *path, int fd)
     dsp_fmt = AFMT_S16_LE;
     dsp_ch = 2;
     dsp_rate = 0;
+    music_frac = 0;
     my_pid = getpid();
     char c[32];
     comm_name(c, sizeof c);
@@ -205,7 +215,7 @@ int ioctl(int fd, unsigned long req, ...)
         if (req == SNDCTL_DSP_SETFMT) dsp_fmt = v;
         else if (req == SNDCTL_DSP_CHANNELS) dsp_ch = v;
         else if (req == SNDCTL_DSP_STEREO) dsp_ch = v ? 2 : 1;
-        else if (req == SNDCTL_DSP_SPEED) dsp_rate = v;
+        else if (req == SNDCTL_DSP_SPEED) { dsp_rate = v; music_frac = 0; }
         else changed = 0;
         if (changed) logf_("[hook]   format %d, %d ch, %d Hz\n", dsp_fmt, dsp_ch, dsp_rate);
     }
@@ -261,8 +271,6 @@ static void slot_set(int on)
     }
 }
 
-static inline int16_t sat(int v) { return (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v); }
-
 ssize_t write(int fd, const void *buf, size_t n)
 {
     resolve();
@@ -282,28 +290,16 @@ ssize_t write(int fd, const void *buf, size_t n)
     size_t frames = n / (2 * (size_t)dsp_ch), done = 0;
     ssize_t total = 0;
     int vol = shm->volume;
+    uint32_t step = bgm_step(dsp_rate, BGM_RATE);
     while (done < frames) {
         size_t chunk = frames - done;
         if (chunk > 4096) chunk = 4096;
         uint32_t r0 = shm->rpos, avail = shm->wpos - r0;
         if (avail > BGM_RING) avail = 0;   // service restarted
-        size_t take = avail < chunk ? avail : chunk;
-        if (take < chunk) shm->underruns++;
         __sync_synchronize();
-        for (size_t i = 0; i < chunk; i++) {
-            int ml = 0, mr = 0;
-            if (i < take) {
-                const int16_t *m = &shm->ring[((r0 + i) & (BGM_RING - 1)) * 2];
-                ml = m[0] * vol >> 8;
-                mr = m[1] * vol >> 8;
-            }
-            if (dsp_ch == 2) {
-                tmp[i * 2] = sat(in[(done + i) * 2] + ml);
-                tmp[i * 2 + 1] = sat(in[(done + i) * 2 + 1] + mr);
-            } else {
-                tmp[i] = sat(in[done + i] + (ml + mr) / 2);
-            }
-        }
+        int under = 0;
+        bgm_mix(tmp, in + done * dsp_ch, chunk, dsp_ch, shm->ring, BGM_RING - 1, r0, avail, music_frac, step, vol, &under);
+        if (under) shm->underruns++;
         size_t bytes = chunk * 2 * dsp_ch;
         ssize_t w = r_write(fd, tmp, bytes);
         if (w <= 0) {
@@ -311,7 +307,7 @@ ssize_t write(int fd, const void *buf, size_t n)
             break;
         }
         size_t wf = (size_t)w / (2 * dsp_ch);
-        shm->rpos = r0 + (uint32_t)(wf < take ? wf : take);
+        shm->rpos = r0 + bgm_advance(wf, music_frac, step, avail, &music_frac);
         shm->mixed_writes++;
         total += w;
         done += wf;

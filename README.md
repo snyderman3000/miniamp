@@ -34,7 +34,9 @@ OnionOS's audioserver takes a single stream of audio, so two programs playing at
 chop each other up. Instead, MiniAmp's background service decodes into shared memory and a
 small wrapper around OnionOS's `libpadsp.so` (which the menu and every game load) mixes
 that music into the program's own sound before it reaches the audioserver. The original
-library is kept as `libpadsp_orig.so` and restored when the option is turned off. See
+library is kept as `libpadsp_orig.so` and restored when the option is turned off. Games play at
+different sample rates (Mario 64 at 32000 Hz, Balatro at 44100, the menu at 48000), so the
+music is resampled to each game's rate as it's mixed in (`src/bgm_mix.h`). See
 `src/padsp_wrap.c` and `src/gamemusic.c`.
 
 **Uninstalling.** Erasing MiniAmp in [Mixtape](https://github.com/snyderman3000/mixtape)
