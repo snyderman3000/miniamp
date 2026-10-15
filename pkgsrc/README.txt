@@ -43,7 +43,9 @@ original is kept as libpadsp_orig.so. Turning the option off puts the original
 back - do that before deleting MiniAmp. If an OnionOS update replaces the file,
 MiniAmp sets it up again the next time the music goes to the background.
 Ports that switch off OnionOS's sound service and talk to the audio chip
-directly (SkiFree, for example) get the music mixed in there too. If a port
+directly get the music mixed in there too. A port that switches the sound
+service off but makes no sound itself stops the music; changing
+KillAudioserver=1 to KillAudioserver=0 in its .port file fixes that. If a port
 misbehaves with that, create an empty file MiniAmp/data/no_chip_hook to turn
 just that part off. Games at any sample rate play the music at normal speed.
 
