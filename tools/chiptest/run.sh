@@ -12,6 +12,14 @@ for r in "48000 2" "22050 2" "32000 1" "44100 2"; do
   $B/feed
   MA_HOOK_LOG=$B/hook.log LD_PRELOAD=$PWD/$B/libpadsp_wrap.so $B/game $r || ok=1
 done
+# MiniAmp's own processes must never get the music mixed into them
+cp $B/game $B/miniamp
+$B/feed
+if MA_HOOK_LOG=$B/hook.log LD_PRELOAD=$PWD/$B/libpadsp_wrap.so $B/miniamp 48000 2 >/dev/null; then
+  echo "FAIL: music was mixed into MiniAmp itself"; ok=1
+else
+  echo "MiniAmp's own process left alone"
+fi
 rm -f /tmp/miniamp_bgm.shm
 cat $B/hook.log
 [ $ok = 0 ] && echo "chip path: all good" || { echo "chip path: FAILED"; exit 1; }

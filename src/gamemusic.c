@@ -197,6 +197,17 @@ void service_spawn(void)
     if (pid == 0) {
         // close everything but stdio so the service doesn't hold the display or input
         for (int fd = 3; fd < 256; fd++) close(fd);
+        // The service plays its own music: it must load OnionOS's original
+        // library, never the wrapper now in miyoo/lib (it would mix the music
+        // into itself and use it up twice as fast).
+        char orig[600];
+        snprintf(orig, sizeof orig, "%s/libpadsp_orig.so", libdir());
+        const char *pre = getenv("LD_PRELOAD");
+        if (exists(orig) && !has_marker(orig)) setenv("LD_PRELOAD", orig, 1);
+        else if (pre && has_marker(pre)) {
+            const char *fb = fallback_padsp();
+            if (fb) setenv("LD_PRELOAD", fb, 1); else unsetenv("LD_PRELOAD");
+        }
         execl(exe, exe, "--service", (char *)NULL);
         _exit(1);
     }

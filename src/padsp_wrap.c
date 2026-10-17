@@ -160,6 +160,19 @@ static uint32_t now_ms(void)
     return (uint32_t)(t.tv_sec * 1000u + t.tv_nsec / 1000000u);
 }
 
+// MiniAmp's own processes (the player and its music service) are never mixed
+// into: they are the music.
+static int self_proc = -1;
+static int is_self(void)
+{
+    if (self_proc < 0) {
+        char c[32];
+        comm_name(c, sizeof c);
+        self_proc = strcmp(c, "miniamp") == 0;
+    }
+    return self_proc;
+}
+
 static int is_dsp(const char *p)
 {
     return p && (!strcmp(p, "/dev/dsp") || !strcmp(p, "/dev/dsp1") || !strcmp(p, "/dev/adsp") || !strcmp(p, "/dev/audio"));
@@ -167,7 +180,7 @@ static int is_dsp(const char *p)
 
 static void track_open(const char *path, int fd)
 {
-    if (fd < 0 || !is_dsp(path)) return;
+    if (fd < 0 || !is_dsp(path) || is_self()) return;
     dsp_fd = fd;
     dsp_fmt = AFMT_S16_LE;
     dsp_ch = 2;
@@ -372,7 +385,7 @@ MI_S32 MI_AO_SetPubAttr(int dev, ma_ao_attr *attr)
     if (!r_ao_setattr) r_ao_setattr = dlsym(RTLD_NEXT, "MI_AO_SetPubAttr");
     if (!r_ao_setattr) return -1;
     MI_S32 r = r_ao_setattr(dev, attr);
-    if (r == 0 && attr && ao_enabled()) {
+    if (r == 0 && attr && ao_enabled() && !is_self()) {
         ao_rate = attr->eSamplerate;
         ao_frac = 0;
         my_pid = getpid();
