@@ -35,6 +35,20 @@ static const char *libdir(void)
 }
 
 static int exists(const char *p) { struct stat st; return stat(p, &st) == 0; }
+static int has_marker(const char *path);
+
+// A copy of OnionOS's own libpadsp.so to fall back on when the backup next to
+// the wrapper is missing: the one launch.sh saved in data/, then the
+// firmware's (which doesn't work with OnionOS's audioserver on every model,
+// e.g. the Mini v4, so it's the last resort). NULL if there's none.
+static const char *fallback_padsp(void)
+{
+    static char p[600];
+    snprintf(p, sizeof p, "%s/libpadsp_onion.so", data_dir);
+    if (exists(p) && !has_marker(p)) return p;
+    if (exists("/customer/lib/libpadsp.so")) return "/customer/lib/libpadsp.so";
+    return NULL;
+}
 
 static int has_marker(const char *path)
 {
@@ -111,7 +125,8 @@ int gm_install(void)
         if (!copy_atomic(cur, orig)) { fprintf(stderr, "[gm] backup failed\n"); return 0; }
     }
     if (!exists(orig) || has_marker(orig)) {
-        if (!exists("/customer/lib/libpadsp.so") || !copy_atomic("/customer/lib/libpadsp.so", orig)) {
+        const char *fb = fallback_padsp();
+        if (!fb || !copy_atomic(fb, orig)) {
             fprintf(stderr, "[gm] no original libpadsp.so to keep\n");
             return 0;
         }
@@ -129,7 +144,8 @@ int gm_uninstall(void)
     snprintf(cur, sizeof cur, "%s/libpadsp.so", libdir());
     snprintf(orig, sizeof orig, "%s/libpadsp_orig.so", libdir());
     if (!exists(orig) || has_marker(orig)) {
-        if (has_marker(cur) && exists("/customer/lib/libpadsp.so")) copy_atomic("/customer/lib/libpadsp.so", cur);
+        const char *fb = fallback_padsp();
+        if (has_marker(cur) && fb) copy_atomic(fb, cur);
         return !has_marker(cur);
     }
     int ok = 1;

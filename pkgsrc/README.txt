@@ -37,6 +37,8 @@ apps. While it plays in the background:
   SELECT + START      pause / resume
 Opening MiniAmp again picks up the same song. Apps that make their own sound
 some other way pause the music until you leave them.
+Sound: MiniAmp plays through OnionOS's own sound library (miyoo/lib), the
+same one the menu and games use, and keeps a copy of it in MiniAmp/data.
 How it works: MiniAmp swaps OnionOS's sound library (miyoo/lib/libpadsp.so)
 for a version that blends the music into the sound of whatever is playing; the
 original is kept as libpadsp_orig.so. Turning the option off puts the original
