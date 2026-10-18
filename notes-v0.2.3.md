@@ -1,0 +1,3 @@
+- **Fixed: no sound inside MiniAmp on the Miyoo Mini v4.** MiniAmp used the firmware's copy of the sound library instead of OnionOS's own, which doesn't work with OnionOS's sound service on the v4. Music in games worked, but the player itself was silent. MiniAmp now uses the same library as the OnionOS menu and every game. Thanks to the v4 owner who reported and tested it.
+- MiniAmp keeps a copy of OnionOS's sound library in `App/MiniAmp/data`. If the backup it normally restores from is ever missing, it uses that copy when turning Music in games off, instead of the firmware's copy (which could have silenced a v4).
+- The background music service now always uses OnionOS's original library, and the music-in-games mixer never mixes into MiniAmp's own processes.
