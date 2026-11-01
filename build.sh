@@ -7,7 +7,7 @@
 set -e
 cd "$(dirname "$0")"
 mkdir -p build
-SRC="src/main.c src/core.c src/audio.c src/decode.c src/meta.c src/skin.c src/zip.c src/font.c src/vis.c src/playlist.c src/gamemusic.c third_party/mini2d.c"
+SRC="src/main.c src/core.c src/audio.c src/decode.c src/meta.c src/skin.c src/zip.c src/font.c src/vis.c src/playlist.c src/gamemusic.c src/net.c src/netstream.c src/am.c third_party/mini2d.c"
 WARN="-Wall -Wno-format-truncation -Wno-unused-function -Wno-unused-variable -Wno-unused-but-set-variable"
 case "${1:-host}" in
 host)

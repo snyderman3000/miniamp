@@ -51,6 +51,18 @@ KillAudioserver=1 to KillAudioserver=0 in its .port file fixes that. If a port
 misbehaves with that, create an empty file MiniAmp/data/no_chip_hook to turn
 just that part off. Games at any sample rate play the music at normal speed.
 
+Apple Music: MiniAmp can play your Apple Music library through Cider (an
+Apple Music app) running on your PC, with the sound streamed to the handheld
+over Wi-Fi. Set up Cider Bridge on the PC first (see the "bridge" folder on
+https://github.com/snyderman3000/miniamp), then open Options > Apple Music.
+MiniAmp finds the PC by itself as long as both are on the same Wi-Fi.
+  A        open / play         Y   play a whole playlist or album
+  B        back                    (or search again if the PC wasn't found)
+While Apple Music plays: A or START pauses, L / R skip, Left / Right seek,
+B browses. Picking music on the SD card switches back and pauses Cider.
+The handheld's address book for the PC is MiniAmp/data/cider_bridge.txt
+(host:port); delete it to make MiniAmp search again.
+
 Skins: copy classic .wsz skin files into MiniAmp/skins, then pick one in
 Options > Skin. Thousands are at https://skins.webamp.org.
 

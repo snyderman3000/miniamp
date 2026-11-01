@@ -1,0 +1,13 @@
+[Unit]
+Description=Cider Bridge (Apple Music stream + control for MiniAmp)
+After=pipewire.service pipewire-pulse.service
+Wants=pipewire-pulse.service
+
+[Service]
+ExecStart=/usr/bin/python3 %h/.local/share/cider-bridge/cider_bridge.py
+WorkingDirectory=%h/.local/share/cider-bridge
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

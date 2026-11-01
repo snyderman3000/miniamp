@@ -17,8 +17,9 @@
 #undef R
 
 #include "decode.h"
+#include "netstream.h"
 
-enum { F_MP3, F_FLAC, F_WAV, F_OGG };
+enum { F_MP3, F_FLAC, F_WAV, F_OGG, F_STREAM };   // F_STREAM: live MP3 over HTTP
 
 struct decoder {
     int fmt;
@@ -30,6 +31,7 @@ struct decoder {
     drflac *flac;
     drwav wav;
     stb_vorbis *ogg;
+    netstream *ns;
     float *tmp;          // for downmixing >2 channels
     int tmp_frames;
 };
@@ -44,6 +46,7 @@ static const char *ext_of(const char *path)
 
 static int format_of(const char *path)
 {
+    if (ns_is_url(path)) return F_STREAM;
     const char *e = ext_of(path);
     if (!strcasecmp(e, "mp3")) return F_MP3;
     if (!strcasecmp(e, "flac")) return F_FLAC;
@@ -53,6 +56,23 @@ static int format_of(const char *path)
 }
 
 int dec_supported(const char *path) { return format_of(path) >= 0; }
+
+// dr_mp3 read callback for a live stream. dr_mp3 gets no seek callback, so it
+// reads past any header instead of trying to rewind (a live stream can't).
+// While dr_mp3 is starting up it needs whole reads (it checks for a 10-byte
+// header); after that, partial reads keep it from draining the jitter buffer.
+static int ns_init_phase;
+static size_t ns_on_read(void *u, void *out, size_t n)
+{
+    if (!ns_init_phase || n > 1024) return ns_read(u, out, n);
+    size_t got = 0;
+    while (got < n) {
+        size_t k = ns_read(u, (char *)out + got, n - got);
+        if (!k) break;
+        got += k;
+    }
+    return got;
+}
 
 decoder *dec_open(const char *path, dec_info *info)
 {
@@ -64,6 +84,18 @@ decoder *dec_open(const char *path, dec_info *info)
     memset(info, 0, sizeof *info);
     int ok = 0;
     switch (fmt) {
+    case F_STREAM:
+        d->ns = ns_open(path);
+        ns_init_phase = 1;
+        int okk = d->ns && drmp3_init(&d->mp3, ns_on_read, NULL, NULL, NULL, d->ns, NULL);
+        ns_init_phase = 0;
+        if (okk) {
+            ok = 1;
+            d->src_ch = d->mp3.channels;
+            info->samplerate = d->mp3.sampleRate;
+            info->frames = 0;   // live: no length
+        }
+        break;
     case F_MP3:
         if (drmp3_init_file(&d->mp3, path, NULL)) {
             ok = 1;
@@ -117,7 +149,8 @@ decoder *dec_open(const char *path, dec_info *info)
 static int read_raw(decoder *d, float *out, int frames)
 {
     switch (d->fmt) {
-    case F_MP3: return (int)drmp3_read_pcm_frames_f32(&d->mp3, frames, out);
+    case F_MP3:
+    case F_STREAM: return (int)drmp3_read_pcm_frames_f32(&d->mp3, frames, out);
     case F_FLAC: return (int)drflac_read_pcm_frames_f32(d->flac, frames, out);
     case F_WAV: return (int)drwav_read_pcm_frames_f32(&d->wav, frames, out);
     case F_OGG: return stb_vorbis_get_samples_float_interleaved(d->ogg, d->src_ch, out, frames * d->src_ch);
@@ -177,6 +210,8 @@ int64_t dec_seek(decoder *d, int64_t frame)
         return drwav_seek_to_pcm_frame(&d->wav, (drwav_uint64)frame) ? frame : -1;
     case F_OGG:
         return stb_vorbis_seek(d->ogg, (unsigned)frame) ? frame : -1;
+    case F_STREAM:
+        return -1;   // live
     }
     return -1;
 }
@@ -186,6 +221,7 @@ void dec_close(decoder *d)
     if (!d) return;
     switch (d->fmt) {
     case F_MP3: if (d->mp3.onRead) drmp3_uninit(&d->mp3); break;
+    case F_STREAM: if (d->mp3.onRead) drmp3_uninit(&d->mp3); ns_close(d->ns); break;
     case F_FLAC: if (d->flac) drflac_close(d->flac); break;
     case F_WAV: if (d->wav.onRead) drwav_uninit(&d->wav); break;
     case F_OGG: if (d->ogg) stb_vorbis_close(d->ogg); break;

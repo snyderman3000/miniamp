@@ -19,6 +19,7 @@
 #include "audio.h"
 #include "decode.h"
 #include "bgm_shm.h"
+#include "netstream.h"
 
 const int EQ_FREQ[EQ_BANDS] = { 60, 170, 310, 600, 1000, 3000, 6000, 12000, 14000, 16000 };
 
@@ -442,6 +443,7 @@ int audio_init(void)
 
 void audio_quit(void)
 {
+    ns_interrupt();
     pthread_mutex_lock(&mtx);
     running = 0;
     pthread_cond_broadcast(&cv);
@@ -454,6 +456,7 @@ void audio_quit(void)
 
 void audio_play_file(const char *path, int start_ms, int paused)
 {
+    ns_interrupt();   // a live stream may be blocked waiting for data
     pthread_mutex_lock(&mtx);
     free(cmd_path);
     cmd_path = strdup(path);
@@ -478,6 +481,7 @@ void audio_set_paused(int paused)
 
 void audio_stop(void)
 {
+    ns_interrupt();
     pthread_mutex_lock(&mtx);
     free(cmd_path); cmd_path = NULL;
     cmd_open = 0;

@@ -11,6 +11,8 @@ A classic-skin music player for the **Miyoo Mini Plus** (OnionOS).
 - Spectrum / oscilloscope in the main window, five full-screen visualizers
 - Music library browser, playlists (`.m3u`), shuffle, repeat, sleep timer
 - Screen-off playback
+- **Apple Music** through [Cider](https://cider.sh) on your PC: browse your library and
+  playlists on the handheld and hear it there, streamed over Wi-Fi (see below)
 - **Music in games**: quit while playing and the music keeps going in the OnionOS menu, in games and in apps (SELECT + L/R skip, SELECT + Up/Down volume, SELECT + START pause)
 
 MiniAmp is an independent project, written from scratch. It is not affiliated
@@ -53,6 +55,29 @@ SkiFree, leaves nothing to mix into, so the music stops; setting `KillAudioserve
 (0.1.5 or later) runs `mixtape-uninstall.sh` first, which stops the background music and
 puts the original library back. If you delete the folder by hand, turn Music in games off
 first, or run `App/MiniAmp/mixtape-uninstall.sh` yourself.
+
+## Apple Music
+
+Apple Music's audio is copy-protected, so the handheld can't play it directly. Instead,
+Cider (an Apple Music client for Linux, Windows and macOS) plays it on your PC and
+**Cider Bridge** (`bridge/`) sends that sound to MiniAmp:
+
+```
+ PC                                                Miyoo Mini Plus
+ Cider ──audio──► Cider Bridge ──MP3 over Wi-Fi──► MiniAmp ──► headphones
+       ◄──RPC───  (port 8780)  ◄──browse/control──
+```
+
+- The bridge moves Cider's audio into a silent virtual output (PipeWire), encodes it to
+  192k MP3 and serves it as a live stream; the PC's speakers stay quiet.
+- MiniAmp finds the bridge with a UDP broadcast on port 8780, so there's no address to
+  type in. Browsing, skipping and seeking go through the bridge to Cider's local API.
+- The stream is decoded by the same engine as local files (`src/netstream.c` feeds
+  `dr_mp3` through a ~1 second jitter buffer), so the EQ, volume and visualizers all work.
+  Skipping or seeking reconnects the stream, so you don't hear the end of the old track.
+
+Setup: [bridge/README.md](bridge/README.md). Linux (PipeWire) only for now.
+The stream is for your own listening on your own network.
 
 ## Building
 

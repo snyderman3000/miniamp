@@ -21,6 +21,7 @@
 #include "core.h"
 #include "gamemusic.h"
 #include "bgm_shm.h"
+#include "am.h"
 
 #define SCREEN_W 640
 #define SCREEN_H 480
@@ -29,7 +30,7 @@
 enum { K_UP = 103, K_DOWN = 108, K_LEFT = 105, K_RIGHT = 106, K_A = 57, K_B = 29, K_X = 42, K_Y = 56,
        K_L = 18, K_R = 20, K_L2 = 15, K_R2 = 14, K_START = 28, K_SELECT = 97, K_MENU = 1, K_POWER = 116 };
 
-enum { SCR_PLAYLIST, SCR_EQ, SCR_BROWSER, SCR_OPTIONS, SCR_SKINS, SCR_VIS, SCR_PRESETS };
+enum { SCR_PLAYLIST, SCR_EQ, SCR_BROWSER, SCR_OPTIONS, SCR_SKINS, SCR_VIS, SCR_PRESETS, SCR_AM };
 
 // ---------------------------------------------------------------- state
 static m2d_surf *bb;
@@ -55,6 +56,17 @@ static double toast_until;
 static int has_dsp;
 static double last_save;
 static int playlist_dirty;
+
+// Apple Music (through Cider Bridge on the user's PC, see am.c)
+static int am_mode;               // Apple Music is the source being played
+static int am_gen;                // bridge stream generation we're connected for
+static double am_retry_at;        // (re)connect the stream at this time, 0 = not pending
+static double am_started_at;      // when the stream was last (re)started
+static am_status ams;             // refreshed every frame while active
+static m2d_surf *am_art;          // album art of the current track
+static double am_seek_due;        // seeking is sent once the button is let go
+static int am_seek_target;        // ms
+#define AM_DELAY_MS 1100          // what you hear is about this far behind Cider
 
 static double now(void)
 {
@@ -159,9 +171,23 @@ static void hint_bar(const hint *h, int n)
 }
 
 // ---------------------------------------------------------------- playback
+static int am_pos_ms(void);
+
 static void update_marquee(void)
 {
     pl_item it;
+    if (am_mode) {
+        if (!ams.found) snprintf(marquee, sizeof marquee, "%s  ***  ", ams.searching ? "LOOKING FOR CIDER BRIDGE ON YOUR NETWORK..." : "CAN'T FIND CIDER BRIDGE - IS IT RUNNING ON YOUR PC?");
+        else if (!ams.cider) snprintf(marquee, sizeof marquee, "CIDER ISN'T OPEN ON YOUR PC  ***  ");
+        else if (!ams.has_track) snprintf(marquee, sizeof marquee, "APPLE MUSIC  ***  PRESS B TO BROWSE  ***  ");
+        else {
+            char d[16] = "";
+            if (ams.dur_ms > 0) { char t[12]; fmt_time(t, sizeof t, ams.dur_ms); snprintf(d, sizeof d, " (%s)", t); }
+            if (ams.artist[0]) snprintf(marquee, sizeof marquee, "%s - %s%s  ***  ", ams.artist, ams.name, d);
+            else snprintf(marquee, sizeof marquee, "%s%s  ***  ", ams.name, d);
+        }
+        return;
+    }
     if (current >= 0 && pl_get(current, &it)) {
         char d[16] = "";
         if (it.dur_ms > 0) { char t[12]; fmt_time(t, sizeof t, it.dur_ms); snprintf(d, sizeof d, " (%s)", t); }
@@ -171,19 +197,36 @@ static void update_marquee(void)
     }
 }
 
+// switching back to the music on the SD card: Cider has nobody listening, so pause it
+static void am_leave(void)
+{
+    if (!am_mode) return;
+    am_mode = 0;
+    am_retry_at = 0;
+    am_seek_due = 0;
+    am_cmd("pause");
+}
+
 static void play_index(int i, int start_ms, int paused)
 {
+    am_leave();
     if (core_play_index(i, start_ms, paused)) marquee_t0 = now_t;
 }
 
 static void skip(int dir)
 {
+    if (am_mode) {
+        am_cmd(dir > 0 ? "next" : "previous");
+        show_msg(dir > 0 ? "NEXT TRACK" : "PREVIOUS TRACK");
+        marquee_t0 = now_t;
+        return;
+    }
     int before = current;
     core_skip(dir);
     if (current != before || audio_pos_ms() < 1000) { sel = current; marquee_t0 = now_t; }
 }
 
-static void toggle_pause(void) { core_toggle_pause(); }
+static void toggle_pause(void) { if (am_mode) am_cmd("playpause"); else core_toggle_pause(); }
 static void apply_audio_settings(void) { core_apply_audio(); }
 static int next_index(int dir) { return core_next_index(dir); }
 static void build_shuffle(void) { core_build_shuffle(); }
@@ -220,8 +263,13 @@ static void draw_main_window(void)
     mainwin_state st;
     memset(&st, 0, sizeof st);
     int as = audio_state();
-    st.state = as;
     int pos = audio_pos_ms(), len = audio_len_ms();
+    if (am_mode) {
+        if (as != A_STOPPED) as = ams.playing ? A_PLAYING : A_PAUSED;
+        pos = am_pos_ms();
+        len = ams.dur_ms;
+    }
+    st.state = as;
     if (len <= 0 && current >= 0) { pl_item it; if (pl_get(current, &it)) len = it.dur_ms; }
     if (len > 0 && pos > len) pos = len;
     st.time_s = S.remaining && len > 0 ? (len - pos + 999) / 1000 : pos / 1000;
@@ -245,6 +293,7 @@ static void draw_main_window(void)
         }
         kbps = cached_kbps;
     }
+    if (am_mode) kbps = ams.kbps;
     st.kbps = kbps;
     st.khz = (rate + 500) / 1000;
     st.channels = ch;
@@ -253,8 +302,8 @@ static void draw_main_window(void)
     st.eq_on = S.eq_on;
     st.pl_on = panel == SCR_PLAYLIST;
     st.pos = len > 0 ? (float)pos / len : -1;
-    st.shuffle = S.shuffle;
-    st.repeat = S.repeat;
+    st.shuffle = am_mode ? ams.shuffle : S.shuffle;
+    st.repeat = am_mode ? ams.repeat != 0 : S.repeat;
     st.pressed = pressed_until > now_t ? pressed : PB_NONE;
     st.vis_mode = S.vis_mode;
     st.bars = vd.bars19;
@@ -431,7 +480,7 @@ static void pill(int right_x, int cy, const char *val, int on)
 }
 
 // ---------------------------------------------------------------- options
-enum { OPT_SCREEN, OPT_GAMEMUSIC, OPT_SHUFFLE, OPT_REPEAT, OPT_SLEEP, OPT_VOLUME, OPT_BALANCE, OPT_MINIVIS, OPT_TIME, OPT_SKIN, OPT_CLEAR, OPT_QUIT, OPT_N };
+enum { OPT_SCREEN, OPT_APPLE, OPT_GAMEMUSIC, OPT_SHUFFLE, OPT_REPEAT, OPT_SLEEP, OPT_VOLUME, OPT_BALANCE, OPT_MINIVIS, OPT_TIME, OPT_SKIN, OPT_CLEAR, OPT_QUIT, OPT_N };
 static int opt_sel;
 static const int SLEEP_STEPS[] = { 0, 15, 30, 45, 60, 90, 120 };
 
@@ -441,8 +490,14 @@ static void opt_value(int i, char *out, int n, int *on)
     out[0] = 0;
     switch (i) {
     case OPT_GAMEMUSIC: snprintf(out, n, "%s", S.game_music ? "On" : "Off"); *on = S.game_music; break;
-    case OPT_SHUFFLE: snprintf(out, n, "%s", S.shuffle ? "On" : "Off"); *on = S.shuffle; break;
-    case OPT_REPEAT: snprintf(out, n, "%s", S.repeat == 1 ? "All" : S.repeat == 2 ? "One" : "Off"); *on = S.repeat != 0; break;
+    case OPT_APPLE: if (am_mode) { snprintf(out, n, "Playing"); *on = 1; } break;
+    case OPT_SHUFFLE:
+        if (am_mode) { snprintf(out, n, "%s", ams.shuffle ? "On" : "Off"); *on = ams.shuffle != 0; break; }
+        snprintf(out, n, "%s", S.shuffle ? "On" : "Off"); *on = S.shuffle; break;
+    case OPT_REPEAT:
+        // Cider: 0 off, 1 one, 2 all
+        if (am_mode) { snprintf(out, n, "%s", ams.repeat == 1 ? "One" : ams.repeat == 2 ? "All" : "Off"); *on = ams.repeat != 0; break; }
+        snprintf(out, n, "%s", S.repeat == 1 ? "All" : S.repeat == 2 ? "One" : "Off"); *on = S.repeat != 0; break;
     case OPT_SLEEP:
         if (sleep_at > 0) { int m = (int)((sleep_at - now_t) / 60 + 0.99); snprintf(out, n, "%d min left", m); *on = 1; }
         else snprintf(out, n, "Off");
@@ -460,18 +515,19 @@ static void opt_value(int i, char *out, int n, int *on)
 
 static void draw_options(void)
 {
-    static const char *labels[OPT_N] = { "Turn screen off", "Music in games", "Shuffle", "Repeat", "Sleep timer", "Volume", "Balance",
+    static const char *labels[OPT_N] = { "Turn screen off", "Apple Music", "Music in games", "Shuffle", "Repeat", "Sleep timer", "Volume", "Balance",
                                          "Mini visualizer", "Time display", "Skin", "Clear playlist", "Quit MiniAmp" };
-    const int x = 110, y = 4, w = 420, h = 438, rh = 30;
+    const int x = 110, y = 4, w = 420, h = 438, rh = 28;
     card(x, y, w, h, "OPTIONS");
     for (int i = 0; i < OPT_N; i++) {
-        int ry = y + 46 + i * (rh + 2);
+        int ry = y + 44 + i * (rh + 2);
         if (i == opt_sel) rrect(x + 12, ry, w - 24, rh, 8, C_SEL);
         font_draw_mid(bb, f_mid, x + 26, ry + rh / 2, labels[i], C_TEXT);
         char v[64];
         int on;
         opt_value(i, v, sizeof v, &on);
         if (i == OPT_SCREEN && i == opt_sel) font_draw_mid(bb, f_small, x + w - 26 - font_width(f_small, "START pauses · L/R skip"), ry + rh / 2, "START pauses · L/R skip", C_DIM);
+        if (i == OPT_APPLE && i == opt_sel && !am_mode) font_draw_mid(bb, f_small, x + 160, ry + rh / 2, "through Cider on your PC", C_DIM);
         if (i == OPT_GAMEMUSIC && i == opt_sel) font_draw_mid(bb, f_small, x + 160, ry + rh / 2, "keeps playing after Quit", C_DIM);
         if (v[0]) {
             char fv[64];
@@ -482,6 +538,7 @@ static void draw_options(void)
 }
 
 static void open_skins(void);
+static void am_open(void);
 
 static void option_change(int dir, int activate)
 {
@@ -498,8 +555,13 @@ static void option_change(int dir, int activate)
         }
         settings_save();
         break;
-    case OPT_SHUFFLE: S.shuffle = !S.shuffle; if (S.shuffle) build_shuffle(); break;
-    case OPT_REPEAT: S.repeat = (S.repeat + (dir < 0 ? 2 : 1)) % 3; break;
+    case OPT_APPLE: if (activate) am_open(); break;
+    case OPT_SHUFFLE:
+        if (am_mode) { am_cmd("shuffle"); ams.shuffle = !ams.shuffle; break; }
+        S.shuffle = !S.shuffle; if (S.shuffle) build_shuffle(); break;
+    case OPT_REPEAT:
+        if (am_mode) { am_cmd("repeat"); ams.repeat = (ams.repeat + 1) % 3; break; }
+        S.repeat = (S.repeat + (dir < 0 ? 2 : 1)) % 3; break;
     case OPT_SLEEP: {
         int k = 0;
         for (int i = 0; i < 7; i++) if (SLEEP_STEPS[i] == sleep_min) k = i;
@@ -864,7 +926,12 @@ static void draw_browser(void)
     }
     // now playing strip
     fill(0, 412, SCREEN_W, 32, C_PANEL);
-    if (current >= 0) {
+    if (am_mode && ams.has_track) {
+        char fitl[300];
+        font_fit(f_small, ams.name, SCREEN_W - 120, fitl, sizeof fitl);
+        font_draw_mid(bb, f_small, 20, 428, ams.playing ? "▶" : "❚❚", acc);
+        font_draw_mid(bb, f_small, 40, 428, fitl, C_MUTED);
+    } else if (current >= 0) {
         pl_item it;
         if (pl_get(current, &it)) {
             char t[16], line[300], fitl[300];
@@ -876,6 +943,327 @@ static void draw_browser(void)
             font_draw_mid(bb, f_small, SCREEN_W - 20 - font_width(f_small, t), 428, t, C_DIM);
         }
     }
+}
+
+// ---------------------------------------------------------------- Apple Music
+// The home screen, a list (playlists, albums...), and the tracks of one of them.
+enum { AMV_HOME, AMV_LIST, AMV_TRACKS };
+typedef struct { int kind; char title[160]; am_item parent; int sel, scroll; } am_view;
+static am_view amv[3];
+static int am_depth;
+
+typedef struct { const char *label, *sub, *path; } am_home_entry;
+static const am_home_entry AM_HOME[] = {
+    { "Now playing in Cider", "Listen to whatever your PC is playing", NULL },
+    { "Recently played", NULL, "/api/recent" },
+    { "Playlists", NULL, "/api/library/playlists" },
+    { "Albums", NULL, "/api/library/albums" },
+    { "Songs", NULL, "/api/library/songs" },
+    { "Music on this SD card", "Back to your own files", NULL },
+};
+#define AM_HOME_N ((int)(sizeof AM_HOME / sizeof AM_HOME[0]))
+
+static int am_pos_ms(void)
+{
+    double p = ams.pos_s * 1000;
+    if (ams.playing && audio_state() != A_STOPPED) p += (am_now() - ams.pos_at) * 1000 - AM_DELAY_MS;
+    if (am_seek_due > 0) p = am_seek_target;
+    if (p < 0) p = 0;
+    if (ams.dur_ms > 0 && p > ams.dur_ms) p = ams.dur_ms;
+    return (int)p;
+}
+
+static void am_restart_stream(void)
+{
+    char url[160];
+    am_retry_at = 0;
+    am_gen = ams.generation;
+    if (!am_stream_url(url, sizeof url)) { am_retry_at = now_t + 2; return; }
+    audio_play_file(url, 0, 0);
+    am_started_at = now_t;
+}
+
+// makes Apple Music the source; wait_for_pc: a command was just sent and the
+// stream should (re)start once the PC has acted on it
+static void am_begin(int wait_for_pc)
+{
+    if (!am_mode) {
+        audio_stop();
+        am_mode = 1;
+        current = -1;
+        am_set_active(1);
+    }
+    marquee_t0 = now_t;
+    if (wait_for_pc) { am_gen = ams.generation; am_retry_at = now_t + 3; }   // fallback if no news
+    else am_restart_stream();
+}
+
+static int am_is_song(const am_item *it) { return strstr(it->type, "song") != NULL; }
+static int am_is_library_list(const am_item *it)
+{
+    return !strcmp(it->type, "library-playlists") || !strcmp(it->type, "library-albums");
+}
+
+static void am_play(const am_item *it)
+{
+    am_play_item(it);
+    am_begin(1);
+    screen = panel = SCR_PLAYLIST;
+    show_toast("Playing %s", it->name);
+}
+
+static void am_open(void)
+{
+    am_set_active(1);
+    screen = SCR_AM;
+}
+
+static void url_escape(char *out, int n, const char *s)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    int o = 0;
+    for (; *s && o < n - 4; s++) {
+        unsigned char c = (unsigned char)*s;
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_' || c == '~') out[o++] = (char)c;
+        else { out[o++] = '%'; out[o++] = hex[c >> 4]; out[o++] = hex[c & 15]; }
+    }
+    out[o] = 0;
+}
+
+static void am_push(int kind, const char *title, const am_item *parent, const char *path)
+{
+    if (am_depth >= 2) return;
+    am_depth++;
+    am_view *v = &amv[am_depth];
+    memset(v, 0, sizeof *v);
+    v->kind = kind;
+    snprintf(v->title, sizeof v->title, "%s", title);
+    if (parent) v->parent = *parent;
+    am_list_load(am_depth - 1, path);
+}
+
+static void am_activate(int play_all)
+{
+    am_view *v = &amv[am_depth];
+    if (v->kind == AMV_HOME) {
+        const am_home_entry *e = &AM_HOME[v->sel];
+        if (v->sel == 0) {
+            if (!ams.found) { am_rediscover(); show_toast("%s", "Looking for Cider Bridge..."); return; }
+            am_begin(0);
+            screen = panel = SCR_PLAYLIST;
+            show_toast("%s", "Listening to Cider");
+        } else if (!e->path) {
+            am_leave();
+            audio_stop();
+            open_browser();
+        } else am_push(AMV_LIST, e->label, NULL, e->path);
+        return;
+    }
+    int slot = am_depth - 1;
+    if (play_all && v->kind == AMV_TRACKS) { am_play(&v->parent); return; }
+    am_item it;
+    if (!am_list_get(slot, v->sel, &it)) return;
+    if (!play_all && !am_is_song(&it) && am_is_library_list(&it)) {
+        char id[200], path[300];
+        url_escape(id, sizeof id, it.id);
+        snprintf(path, sizeof path, "/api/library/%s/%s/tracks", strstr(it.type, "album") ? "albums" : "playlists", id);
+        am_push(AMV_TRACKS, it.name, &it, path);
+        return;
+    }
+    am_play(&it);
+}
+
+static void am_back(void)
+{
+    if (am_depth == 0) { screen = panel; return; }
+    am_list_clear(am_depth - 1);
+    am_depth--;
+}
+
+static void draw_am_browser(void)
+{
+    am_view *v = &amv[am_depth];
+    m2d_clear(bb, C_BG, 0);
+    fill(0, 0, SCREEN_W, 50, C_PANEL);
+    fill(0, 50, SCREEN_W, 1, C_LINE);
+    font_draw_mid(bb, f_title, 20, 25, "APPLE MUSIC", accent());
+    char right[200], fit[200];
+    if (v->kind == AMV_HOME) {
+        if (ams.searching) snprintf(right, sizeof right, "looking for your PC...");
+        else if (!ams.found) snprintf(right, sizeof right, "PC not found");
+        else if (!ams.cider) snprintf(right, sizeof right, "Cider isn't open");
+        else snprintf(right, sizeof right, "via Cider on %s", ams.host);
+    } else snprintf(right, sizeof right, "%s", v->title);
+    font_fit_left(f_small, right, 400, fit, sizeof fit);
+    font_draw_mid(bb, f_small, SCREEN_W - 20 - font_width(f_small, fit), 25, fit, C_DIM);
+
+    uint32_t acc = accent();
+    int n, slot = am_depth - 1;
+    if (v->kind == AMV_HOME) n = AM_HOME_N;
+    else {
+        n = am_list_count(slot);
+        int more;
+        char err[160];
+        int loading = am_list_state(slot, &more, err, sizeof err);
+        if (!n) {
+            const char *t = loading ? "Loading..." : err[0] ? err : "Nothing here";
+            font_draw_mid(bb, f_mid, (SCREEN_W - font_width(f_mid, t)) / 2, 200, t, C_DIM);
+        }
+        if (more && !loading && v->sel >= n - 6) am_list_more(slot);
+    }
+    if (v->sel >= n) v->sel = n ? n - 1 : 0;
+    if (v->sel < v->scroll) v->scroll = v->sel;
+    if (v->sel >= v->scroll + B_ROWS) v->scroll = v->sel - B_ROWS + 1;
+    for (int r = 0; r < B_ROWS && v->scroll + r < n; r++) {
+        int i = v->scroll + r, y = B_TOP + r * B_ROWH, cy = y + B_ROWH / 2 - 1;
+        if (i == v->sel) rrect(10, y, SCREEN_W - 20, B_ROWH - 2, 8, C_SEL);
+        char nm[400], sub[200];
+        if (v->kind == AMV_HOME) {
+            const am_home_entry *e = &AM_HOME[i];
+            if (i == 0) font_draw_mid(bb, f_mid, 26, cy, "▶", C_GREEN);
+            else if (!e->path) folder_icon(24, cy, C_DIM);
+            else folder_icon(24, cy, acc);
+            font_draw_mid(bb, f_mid, 54, cy, e->label, C_TEXT);
+            if (e->sub && i == v->sel) {
+                font_fit(f_small, e->sub, 260, sub, sizeof sub);
+                font_draw_mid(bb, f_small, SCREEN_W - 26 - font_width(f_small, sub), cy, sub, C_DIM);
+            }
+            continue;
+        }
+        am_item it;
+        if (!am_list_get(slot, i, &it)) break;
+        int song = am_is_song(&it);
+        if (song) font_draw_mid(bb, f_mid, 26, cy, "♪", C_DIM);
+        else if (strstr(it.type, "playlist")) font_draw_mid(bb, f_mid, 26, cy, "≡", C_GREEN);
+        else folder_icon(24, cy, acc);
+        char right2[64] = "";
+        if (song && it.dur_ms > 0) fmt_time(right2, sizeof right2, it.dur_ms);
+        else if (it.tracks > 0) snprintf(right2, sizeof right2, "%d", it.tracks);
+        int rw = right2[0] ? font_width(f_key, right2) + 16 : 0;
+        int avail = SCREEN_W - 54 - 26 - rw;
+        font_fit(f_mid, it.name, it.artist[0] ? avail * 6 / 10 : avail, nm, sizeof nm);
+        font_draw_mid(bb, f_mid, 54, cy, nm, song ? C_MUTED : C_TEXT);
+        if (it.artist[0]) {
+            int x = 54 + font_width(f_mid, nm) + 12;
+            font_fit(f_small, it.artist, SCREEN_W - 26 - rw - x, sub, sizeof sub);
+            font_draw_mid(bb, f_small, x, cy + 1, sub, C_DIM);
+        }
+        if (right2[0]) font_draw_mid(bb, f_key, SCREEN_W - 26 - font_width(f_key, right2), cy, right2, C_DIM);
+    }
+    if (n > B_ROWS) {
+        int track = B_ROWS * B_ROWH, th = track * B_ROWS / n;
+        if (th < 16) th = 16;
+        int ty = B_TOP + (track - th) * v->scroll / (n - B_ROWS);
+        fill(SCREEN_W - 6, B_TOP, 3, track, C_LINE);
+        fill(SCREEN_W - 6, ty, 3, th, C_DIM);
+    }
+    // now playing strip
+    fill(0, 412, SCREEN_W, 32, C_PANEL);
+    if (am_mode && ams.has_track) {
+        char line[400], fitl[400], t[16];
+        if (ams.artist[0]) snprintf(line, sizeof line, "%s - %s", ams.artist, ams.name);
+        else snprintf(line, sizeof line, "%s", ams.name);
+        fmt_time(t, sizeof t, am_pos_ms());
+        font_fit(f_small, line, SCREEN_W - 120, fitl, sizeof fitl);
+        font_draw_mid(bb, f_small, 20, 428, ams.playing ? "▶" : "❚❚", acc);
+        font_draw_mid(bb, f_small, 40, 428, fitl, C_MUTED);
+        font_draw_mid(bb, f_small, SCREEN_W - 20 - font_width(f_small, t), 428, t, C_DIM);
+    } else if (!ams.found && !ams.searching) {
+        const char *t = "Start Cider Bridge on your PC, then press Y to search again";
+        font_draw_mid(bb, f_small, 20, 428, t, C_DIM);
+    }
+}
+
+// the panel under the main window while Apple Music plays
+static void draw_am_panel(void)
+{
+    panel_frame("APPLE MUSIC", ams.found ? ams.host : NULL);
+    int ax = PX + 14, ay = PY + 32, as = 148;
+    if (am_art) m2d_blit(am_art, 0, 0, am_art->w, am_art->h, bb, ax, ay, as, as, 0xffffffffu, M2D_REPLACE, 0);
+    else {
+        fill(ax, ay, as, as, mix(sk->pl_bg, 0xffffffffu, 0.06f));
+        font_draw_mid(bb, f_big, ax + (as - font_width(f_big, "♪")) / 2, ay + as / 2, "♪", mix(sk->pl_normal, sk->pl_bg, 0.5f));
+    }
+    int tx = ax + as + 18, tw = PX + PW - 16 - tx;
+    char b[400];
+    uint32_t dim = mix(sk->pl_normal, sk->pl_bg, 0.35f);
+    if (!ams.found) {
+        font_draw_mid(bb, f_mid, tx, ay + 20, ams.searching ? "Looking for your PC..." : "Can't find Cider Bridge", sk->pl_current);
+        font_draw_mid(bb, f_small, tx, ay + 46, "Make sure it's running on your PC", dim);
+        font_draw_mid(bb, f_small, tx, ay + 66, "and you're on the same Wi-Fi.", dim);
+        return;
+    }
+    if (!ams.cider) {
+        font_draw_mid(bb, f_mid, tx, ay + 20, "Cider isn't open", sk->pl_current);
+        font_draw_mid(bb, f_small, tx, ay + 46, "Open Cider on your PC to listen.", dim);
+        return;
+    }
+    if (!ams.has_track) {
+        font_draw_mid(bb, f_mid, tx, ay + 20, "Nothing playing", sk->pl_current);
+        font_draw_mid(bb, f_small, tx, ay + 46, "Press B to pick something.", dim);
+        return;
+    }
+    font_fit(f_title, ams.name, tw, b, sizeof b);
+    font_draw_mid(bb, f_title, tx, ay + 18, b, sk->pl_current);
+    font_fit(f_mid, ams.artist, tw, b, sizeof b);
+    font_draw_mid(bb, f_mid, tx, ay + 48, b, sk->pl_normal);
+    font_fit(f_small, ams.album, tw, b, sizeof b);
+    font_draw_mid(bb, f_small, tx, ay + 72, b, dim);
+    // progress
+    int pos = am_pos_ms(), len = ams.dur_ms;
+    int by = ay + as - 30;
+    fill(tx, by, tw, 4, mix(sk->pl_bg, 0xffffffffu, 0.1f));
+    if (len > 0) fill(tx, by, (int)((long long)tw * pos / len), 4, accent());
+    char a[16], c[16];
+    fmt_time(a, sizeof a, pos);
+    fmt_time(c, sizeof c, len);
+    font_draw_mid(bb, f_small, tx, by + 18, a, dim);
+    font_draw_mid(bb, f_small, tx + tw - font_width(f_small, c), by + 18, c, dim);
+    if (!ams.playing) font_draw_mid(bb, f_small, tx + (tw - font_width(f_small, "PAUSED")) / 2, by + 18, "PAUSED", accent());
+}
+
+// called every frame: keeps the stream in step with what the PC is doing
+static void am_update(void)
+{
+    static int was_active = -1;
+    int act = am_mode || screen == SCR_AM;
+    if (act != was_active) { am_set_active(act); was_active = act; }
+    if (!act) return;
+    am_get_status(&ams);
+    uint8_t *px;
+    int w, h;
+    if (am_take_art(&px, &w, &h)) {
+        if (am_art) { m2d_surface_free(am_art); am_art = NULL; }
+        if (px && w > 0 && h > 0) {
+            am_art = m2d_surface_new(w, h);
+            if (am_art) m2d_surface_upload_rgba(am_art, px, w, h);
+        }
+        free(px);
+    }
+    if (!am_mode) return;
+    if (am_seek_due > 0 && now_t >= am_seek_due) {
+        am_seek_due = 0;
+        am_seek(am_seek_target / 1000);   // the reply bumps the generation, which restarts the stream
+    }
+    // the PC skipped, seeked or started something new: reconnect so we don't
+    // hear the tail of the old track that's still in our buffer
+    if (ams.generation != am_gen) am_restart_stream();
+    else if (am_retry_at > 0 && now_t >= am_retry_at) am_restart_stream();
+}
+
+static void am_seek_by(int delta_ms)
+{
+    if (!ams.has_track) return;
+    if (am_seek_due <= 0) am_seek_target = am_pos_ms();
+    am_seek_target += delta_ms;
+    if (am_seek_target < 0) am_seek_target = 0;
+    if (ams.dur_ms > 0 && am_seek_target > ams.dur_ms - 2000) am_seek_target = ams.dur_ms - 2000;
+    am_seek_due = now_t + 0.6;
+    char a[16], b[16], m[64];
+    fmt_time(a, sizeof a, am_seek_target);
+    fmt_time(b, sizeof b, ams.dur_ms);
+    snprintf(m, sizeof m, "SEEK TO: %s/%s", a, b);
+    show_msg(m);
 }
 
 // ---------------------------------------------------------------- visualizer screen
@@ -891,10 +1279,11 @@ static void draw_vis(void)
         uint32_t al = (uint32_t)(a * 255);
         pl_item it;
         char line[260] = "", sub[120];
-        if (current >= 0 && pl_get(current, &it)) font_fit(f_mid, it.name, 520, line, sizeof line);
+        if (am_mode) font_fit(f_mid, ams.name, 520, line, sizeof line);
+        else if (current >= 0 && pl_get(current, &it)) font_fit(f_mid, it.name, 520, line, sizeof line);
         char t[16], l[16];
-        fmt_time(t, sizeof t, audio_pos_ms());
-        fmt_time(l, sizeof l, audio_len_ms());
+        fmt_time(t, sizeof t, am_mode ? am_pos_ms() : audio_pos_ms());
+        fmt_time(l, sizeof l, am_mode ? ams.dur_ms : audio_len_ms());
         snprintf(sub, sizeof sub, "%s / %s   ·   %s", t, l, vis_preset_name(S.vis_preset));
         int w = font_width(f_mid, line);
         int sw = font_width(f_small, sub);
@@ -953,6 +1342,26 @@ static void on_key(int k, int repeat)
         else if ((k == K_B || k == K_MENU) && !repeat) close_skins(0);
         return;
     }
+    if (screen == SCR_AM) {
+        am_view *v = &amv[am_depth];
+        int n = v->kind == AMV_HOME ? AM_HOME_N : am_list_count(am_depth - 1);
+        if (k == K_UP && n) v->sel = (v->sel + n - 1) % n;
+        else if (k == K_DOWN && n) v->sel = (v->sel + 1) % n;
+        else if (k == K_L2 || k == K_LEFT) v->sel = v->sel - B_ROWS < 0 ? 0 : v->sel - B_ROWS;
+        else if (k == K_R2 || k == K_RIGHT) v->sel = n ? (v->sel + B_ROWS >= n ? n - 1 : v->sel + B_ROWS) : 0;
+        else if (repeat) return;
+        else if (k == K_A && n) am_activate(0);
+        else if (k == K_Y) {
+            if (!ams.found) { am_rediscover(); show_toast("%s", "Looking for Cider Bridge..."); }
+            else if (v->kind != AMV_HOME && n) am_activate(1);
+        }
+        else if (k == K_B) am_back();
+        else if (k == K_START) toggle_pause();
+        else if (k == K_SELECT || k == K_MENU) screen = panel;
+        else if (k == K_L) skip(-1);
+        else if (k == K_R) skip(1);
+        return;
+    }
     if (screen == SCR_BROWSER) {
         if (k == K_UP && nents) b_sel = (b_sel + nents - 1) % nents;
         else if (k == K_DOWN && nents) b_sel = (b_sel + 1) % nents;
@@ -986,6 +1395,18 @@ static void on_key(int k, int repeat)
     if (k == K_START && !repeat) { int st = audio_state(); press_flash(st == A_PLAYING ? PB_PAUSE : PB_PLAY); toggle_pause(); return; }
     if ((k == K_SELECT || k == K_MENU) && !repeat) { opt_sel = 0; screen = SCR_OPTIONS; return; }
     if (k == K_X && screen == SCR_PLAYLIST && !repeat) { screen = SCR_VIS; vis_info_until = now_t + 3; return; }
+    if (screen == SCR_PLAYLIST && am_mode) {
+        if (k == K_LEFT || k == K_RIGHT) {
+            if (!repeat) held_since = now_t;
+            int step = now_t - held_since > 2.0 ? 30000 : now_t - held_since > 0.8 ? 10000 : 5000;
+            am_seek_by(k == K_LEFT ? -step : step);
+        }
+        else if (repeat) return;
+        else if (k == K_A) { press_flash(ams.playing ? PB_PAUSE : PB_PLAY); toggle_pause(); }
+        else if (k == K_B) { press_flash(PB_EJECT); am_open(); }
+        else if (k == K_Y) { press_flash(PB_EQ); screen = panel = SCR_EQ; }
+        return;
+    }
     if (screen == SCR_PLAYLIST) {
         int n = pl_count();
         if (k == K_UP && n) sel = (sel + n - 1) % n;
@@ -1033,7 +1454,16 @@ static void on_key(int k, int repeat)
 static void draw_frame(void)
 {
     bb = m2d_backbuffer();
-    if (screen == SCR_BROWSER) {
+    if (screen == SCR_AM) {
+        draw_am_browser();
+        if (amv[am_depth].kind == AMV_HOME) {
+            hint h[] = { { "A", "Open" }, { "B", "Back" } };
+            hint_bar(h, 2);
+        } else {
+            hint h[] = { { "A", "Open / Play" }, { "Y", "Play all" }, { "B", "Back" } };
+            hint_bar(h, 3);
+        }
+    } else if (screen == SCR_BROWSER) {
         draw_browser();
         hint h[] = { { "A", "Open / Play" }, { "X", "Add" }, { "Y", "Play all" }, { "B", "Back" } };
         hint_bar(h, 4);
@@ -1056,6 +1486,10 @@ static void draw_frame(void)
             draw_eq_panel();
             hint h[] = { { "↑/↓", "Level" }, { "←/→", "Band" }, { "A", "On/Off" }, { "X", "Presets" }, { "B", "Back" } };
             hint_bar(h, 5);
+        } else if (am_mode) {
+            draw_am_panel();
+            hint h[] = { { "A", "Pause" }, { "B", "Browse" }, { "Y", "EQ" }, { "X", "Visuals" }, { "SELECT", "Menu" } };
+            hint_bar(h, 5);
         } else {
             draw_playlist_panel();
             hint h[] = { { "A", "Play" }, { "B", "Library" }, { "Y", "EQ" }, { "X", "Visuals" }, { "SELECT", "Menu" } };
@@ -1073,7 +1507,7 @@ static void draw_frame(void)
     }
     if (toast_until > now_t) {
         int w = font_width(f_mid, toast) + 36;
-        int x = (SCREEN_W - w) / 2, y = screen == SCR_BROWSER ? 370 : screen == SCR_OPTIONS ? 443 : 396;
+        int x = (SCREEN_W - w) / 2, y = screen == SCR_BROWSER || screen == SCR_AM ? 370 : screen == SCR_OPTIONS ? 443 : 396;
         rrect(x, y, w, 34, 17, 0xf0262b36u);
         font_draw_mid(bb, f_mid, x + 18, y + 17, toast, C_TEXT);
     }
@@ -1084,8 +1518,10 @@ static void on_signal(int s) { (void)s; quit = 1; }
 
 static void save_all(void)
 {
-    S.cur_index = current;
-    S.cur_pos_ms = current >= 0 ? audio_pos_ms() : 0;
+    if (!am_mode) {   // keep the SD card resume point while Apple Music plays
+        S.cur_index = current;
+        S.cur_pos_ms = current >= 0 ? audio_pos_ms() : 0;
+    }
     settings_save();
     if (playlist_dirty) {
         char p[1024];
@@ -1154,6 +1590,7 @@ int main(int argc, char **argv)
 
     has_dsp = audio_init();
     apply_audio_settings();
+    am_init(data_dir);
     pl_init();
     path_join(p, sizeof p, data_dir, "playlist.m3u");
     pl_load_m3u(p);
@@ -1200,7 +1637,16 @@ int main(int argc, char **argv)
             on_key(held_key, 1);
             next_repeat = now_t + ((held_key == K_LEFT || held_key == K_RIGHT) && screen == SCR_PLAYLIST ? 0.16 : 0.07);
         }
-        if (audio_take_finished()) {
+        am_update();
+        if (am_mode) {
+            // the stream dropped (PC asleep, Wi-Fi hiccup): reconnect in a moment
+            int fin = audio_take_finished(), err = audio_take_error();
+            if ((fin || err) && now_t - am_started_at > 1.0 && am_retry_at == 0) {
+                am_retry_at = now_t + 2;
+                show_toast("%s", "Reconnecting to your PC...");
+            }
+        }
+        else if (audio_take_finished()) {
             errors = 0;
             if (S.repeat == 2 && current >= 0) play_index(current, 0, 0);
             else {
@@ -1209,7 +1655,7 @@ int main(int argc, char **argv)
                 else S.cur_pos_ms = 0;
             }
         }
-        if (audio_take_error()) {
+        if (!am_mode && audio_take_error()) {
             const char *bad = pl_path(current);
             fprintf(stderr, "[play] could not open %s\n", bad ? bad : "?");
             show_toast("%s", "Couldn't play that file — skipping");
@@ -1217,7 +1663,7 @@ int main(int argc, char **argv)
         }
         if (sleep_at > 0 && now_t >= sleep_at) {
             sleep_at = 0; sleep_min = 0;
-            audio_set_paused(1);
+            if (am_mode) am_cmd("pause"); else audio_set_paused(1);
             show_toast("%s", "Sleep timer: paused");
         }
         if (now_t - last_save > 15) { save_all(); last_save = now_t; }
@@ -1260,6 +1706,8 @@ int main(int argc, char **argv)
     if (screen_off) set_screen_off(0);
     int handoff = S.game_music && current >= 0 && audio_state() == A_PLAYING;
     save_all();
+    if (am_mode) am_pause_now();   // nobody is listening any more
+    am_quit();
     audio_quit();
     pl_quit();
     m2d_quit();

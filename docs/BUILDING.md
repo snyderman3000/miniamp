@@ -14,6 +14,12 @@ Test the music-in-games mixer (resampling to each game's rate):
 
     gcc -O2 -Isrc tools/test_mix.c -o build/test_mix -lm && build/test_mix
 
+Test the Apple Music stream decoder against a running Cider Bridge
+(`python3 bridge/cider_bridge.py --test-tone` streams a 440 Hz tone):
+
+    gcc -O2 -Isrc -Ithird_party tools/test_stream.c src/decode.c src/netstream.c src/net.c \
+        -o build/test_stream -lm -lpthread && build/test_stream http://127.0.0.1:8780/stream.mp3 10
+
 ## Miyoo Mini Plus
 
 Needs the Miyoo Mini toolchain (`TOOLCHAIN`, default `/opt/mini`) and the

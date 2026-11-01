@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cider Bridge Test</title>
+<style>
+  :root { --bg:#0e1116; --panel:#171c24; --text:#e6e9ef; --dim:#8a93a3; --accent:#3ddc84; --line:#262d38; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.4 system-ui, sans-serif; padding:16px; max-width:560px; margin:auto; }
+  h1 { font-size:16px; letter-spacing:.08em; text-transform:uppercase; color:var(--accent); margin:0 0 12px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px; margin-bottom:12px; }
+  .np { display:flex; gap:12px; align-items:center; }
+  .np img { width:72px; height:72px; border-radius:6px; background:#222; object-fit:cover; }
+  .title { font-weight:600; } .sub { color:var(--dim); font-size:13px; }
+  .btns { display:flex; gap:8px; margin-top:10px; flex-wrap:wrap; }
+  button { background:#222a35; color:var(--text); border:1px solid var(--line); border-radius:8px; padding:8px 12px; font-size:14px; cursor:pointer; }
+  button.primary { background:var(--accent); color:#06130b; border:none; font-weight:600; }
+  input { width:100%; background:#0b0e13; color:var(--text); border:1px solid var(--line); border-radius:8px; padding:9px; font-size:15px; }
+  .tabs { display:flex; gap:6px; margin-bottom:8px; flex-wrap:wrap; }
+  .item { display:flex; gap:10px; align-items:center; padding:7px 0; border-top:1px solid var(--line); cursor:pointer; }
+  .item img { width:40px; height:40px; border-radius:4px; background:#222; object-fit:cover; flex:none; }
+  .status { font-size:12px; color:var(--dim); }
+  .err { color:#ff6b6b; }
+</style>
+</head>
+<body>
+<h1>Cider Bridge</h1>
+
+<div class="card">
+  <div class="np">
+    <img id="art" alt="">
+    <div><div class="title" id="t">—</div><div class="sub" id="a"></div><div class="status" id="st"></div></div>
+  </div>
+  <div class="btns">
+    <button class="primary" id="listen">▶ Listen here</button>
+    <button data-cmd="previous">⏮</button>
+    <button data-cmd="playpause">⏯</button>
+    <button data-cmd="next">⏭</button>
+    <button data-cmd="shuffle">Shuffle</button>
+  </div>
+  <audio id="audio" preload="none"></audio>
+</div>
+
+<div class="card">
+  <input id="q" placeholder="Search Apple Music…" enterkeyhint="search">
+  <div class="tabs" style="margin-top:8px">
+    <button data-lib="playlists">Playlists</button>
+    <button data-lib="albums">Albums</button>
+    <button data-lib="songs">Songs</button>
+    <button data-recent>Recent</button>
+  </div>
+  <div id="list"></div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const audio = $('#audio');
+let listening = false, gen = null;
+
+async function api(path, body) {
+  const r = await fetch(path, body === undefined ? {} :
+    { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || r.status);
+  return j;
+}
+
+function restartStream() {
+  // Reconnecting jumps to the live point; this is what MiniAmp does on skip.
+  audio.src = '/stream.mp3?t=' + Date.now();
+  audio.play().catch(()=>{});
+}
+
+$('#listen').onclick = () => {
+  listening = !listening;
+  if (listening) { restartStream(); $('#listen').textContent = '■ Stop listening'; }
+  else { audio.pause(); audio.removeAttribute('src'); $('#listen').textContent = '▶ Listen here'; }
+};
+
+document.querySelectorAll('[data-cmd]').forEach(b => b.onclick = async () => {
+  try { await api('/api/' + b.dataset.cmd, {}); poll(); } catch (e) { $('#st').innerHTML = `<span class=err>${e.message}</span>`; }
+});
+
+async function poll() {
+  try {
+    const s = await api('/api/status');
+    if (!s.cider) { $('#t').textContent = 'Cider not running'; $('#a').textContent = ''; $('#art').removeAttribute('src'); return; }
+    const t = s.track;
+    $('#t').textContent = t ? t.name : 'Nothing playing';
+    $('#a').textContent = t ? `${t.artist || ''} — ${t.album || ''}` : '';
+    if (t && t.artwork && $('#art').getAttribute('src') !== t.artwork) $('#art').src = t.artwork;
+    $('#st').textContent = `${s.playing ? 'playing' : 'paused'} · listeners: ${s.listeners}`;
+    if (gen !== null && s.generation !== gen && listening) restartStream();
+    gen = s.generation;
+  } catch (e) { $('#st').innerHTML = `<span class=err>${e.message}</span>`; }
+}
+setInterval(poll, 2000); poll();
+
+function render(items, label) {
+  const list = $('#list');
+  list.innerHTML = label ? `<div class="sub" style="margin:6px 0">${label}</div>` : '';
+  if (!items.length) { list.innerHTML += '<div class="sub">Nothing here.</div>'; return; }
+  for (const it of items) {
+    const row = document.createElement('div');
+    row.className = 'item';
+    row.innerHTML = `<img ${it.artwork ? `src="${it.artwork}"` : ''} alt=""><div><div>${it.name || '?'}</div><div class="sub">${it.artist || it.type}</div></div>`;
+    row.onclick = async () => {
+      try { await api('/api/play_item', it.href ? {href: it.href} : {type: it.type, id: it.id}); setTimeout(poll, 800); }
+      catch (e) { $('#st').innerHTML = `<span class=err>${e.message}</span>`; }
+    };
+    list.appendChild(row);
+  }
+}
+
+document.querySelectorAll('[data-lib]').forEach(b => b.onclick = async () => {
+  try { render((await api('/api/library/' + b.dataset.lib)).items); } catch (e) { $('#list').innerHTML = `<div class=err>${e.message}</div>`; }
+});
+$('[data-recent]').onclick = async () => {
+  try { render((await api('/api/recent')).items); } catch (e) { $('#list').innerHTML = `<div class=err>${e.message}</div>`; }
+};
+$('#q').onkeydown = async e => {
+  if (e.key !== 'Enter') return;
+  try {
+    const r = await api('/api/search?q=' + encodeURIComponent($('#q').value));
+    render([...r.songs, ...r.albums, ...r.playlists], 'Songs, albums, playlists');
+  } catch (err) { $('#list').innerHTML = `<div class=err>${err.message}</div>`; }
+};
+</script>
+</body>
+</html>
