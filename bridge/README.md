@@ -59,8 +59,13 @@ Base URL: `http://<pc-ip>:8780`
 | POST | `/api/play_item` | `{"href": ...}` from any list item, or `{"type","id"}`. Bumps `generation`. |
 | GET | `/api/library/{playlists,albums,songs,artists}?offset=0` | `{items:[...], next_offset?}` |
 | GET | `/api/library/playlists/<id>/tracks` | Same for `albums/<id>/tracks`. |
-| GET | `/api/recent` | Recently played. |
-| GET | `/api/search?q=...` | `{songs:[], albums:[], playlists:[]}` |
+| GET | `/api/library/recently-added` | New in your library (pages of 25). |
+| GET | `/api/recent` | Recently played (pages of 10). |
+| GET | `/api/search?q=...` | Catalog search: `{songs, albums, artists, playlists, sections}` |
+| GET | `/api/charts/{songs,albums,playlists}` | Apple Music Top Charts for your storefront. |
+| GET | `/api/recommendations` | Your "Made for You" shelves: `{sections:[{title, items}]}` |
+| GET | `/api/catalog/{albums,playlists}/<id>/tracks` | Tracks of a catalog album or playlist. |
+| GET | `/api/catalog/artists/<id>/albums` | An artist's albums. |
 | GET | `/api/art?u=...` | JPEG artwork over plain http. Item `artwork` fields already point here. |
 
 Each list item looks like this:
@@ -77,5 +82,6 @@ Each list item looks like this:
 
 - Playing a playlist starts at the top. There is no "start at track 7" yet.
 - LAN only, with no auth on the bridge. Keep it on your home network.
-- Search exists in the API but not yet in MiniAmp (it needs an on-screen keyboard).
+- Apple's API has no official "new releases" list, so What's new uses Top Charts, your
+  recommendations and Apple's New Music Daily playlist.
 - Streamed audio is for your own listening. Don't share the bridge publicly.

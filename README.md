@@ -11,8 +11,9 @@ A classic-skin music player for the **Miyoo Mini Plus** (OnionOS).
 - Spectrum / oscilloscope in the main window, five full-screen visualizers
 - Music library browser, playlists (`.m3u`), shuffle, repeat, sleep timer
 - Screen-off playback
-- **Apple Music** through [Cider](https://cider.sh) on your PC: browse your library and
-  playlists on the handheld and hear it there, streamed over Wi-Fi (see below)
+- **Apple Music** through [Cider](https://cider.sh) on your PC: browse your library,
+  search the catalog, see what's new and hear it on the handheld, streamed over Wi-Fi
+  (see below)
 - **Music in games**: quit while playing and the music keeps going in the OnionOS menu, in games and in apps (SELECT + L/R skip, SELECT + Up/Down volume, SELECT + START pause)
 
 MiniAmp is an independent project, written from scratch. It is not affiliated

@@ -219,6 +219,20 @@ static void parse_items(char *text, list *l, int epoch)
     char *save = NULL;
     for (char *line = strtok_r(text, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
         if (line[0] == 'N' && line[1] == '\t') { next = atoi(line + 2); continue; }
+        if (line[0] == 'S' && line[1] == '\t') {
+            // a section header ("Songs", "Made for You"): stored as an item of type _section
+            am_item sec;
+            memset(&sec, 0, sizeof sec);
+            snprintf(sec.type, sizeof sec.type, "_section");
+            copy_utf8(sec.name, sizeof sec.name, line + 2);
+            pthread_mutex_lock(&mtx);
+            if (l->epoch == epoch) {
+                if (l->n == l->cap) { l->cap = l->cap ? l->cap * 2 : 64; l->items = realloc(l->items, sizeof *l->items * l->cap); }
+                l->items[l->n++] = sec;
+            }
+            pthread_mutex_unlock(&mtx);
+            continue;
+        }
         if (line[0] != 'I' || line[1] != '\t') continue;
         char *f[9];
         char *p = line + 2;

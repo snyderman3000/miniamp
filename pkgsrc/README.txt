@@ -58,6 +58,13 @@ https://github.com/snyderman3000/miniamp), then open Options > Apple Music.
 MiniAmp finds the PC by itself as long as both are on the same Wi-Fi.
   A        open / play         Y   play a whole playlist or album
   B        back                    (or search again if the PC wasn't found)
+  X        search (from the Apple Music home screen)
+Search: type with the on-screen keyboard (A types, B deletes, Y space,
+X clears, START searches). Results come in Songs, Albums, Artists and
+Playlists; open an artist to see their albums.
+What's new: New Music Daily, Top songs, Top albums, Top playlists and your
+Made for You recommendations. Recently added (on the home screen) shows
+what's new in your own library.
 While Apple Music plays: A or START pauses, L / R skip, Left / Right seek,
 B browses. Picking music on the SD card switches back and pauses Cider.
 The handheld's address book for the PC is MiniAmp/data/cider_bridge.txt

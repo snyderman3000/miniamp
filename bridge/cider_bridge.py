@@ -375,7 +375,12 @@ LIBRARY = {
     "albums": "/v1/me/library/albums",
     "songs": "/v1/me/library/songs",
     "artists": "/v1/me/library/artists",
+    "recently-added": "/v1/me/library/recently-added",
 }
+# Apple caps page sizes per endpoint; asking for more is an error
+PAGE = {"recently-added": 25}
+CHART_TYPES = ("songs", "albums", "playlists")
+SEARCH_TYPES = (("songs", "Songs"), ("albums", "Albums"), ("artists", "Artists"), ("playlists", "Playlists"))
 
 
 ITEM_FIELDS = ("id", "type", "href", "name", "artist", "album", "duration_ms", "track_count", "artwork")
@@ -393,7 +398,7 @@ def to_text(obj):
     """Plain-text form of a response, for MiniAmp (easy to read in C, no JSON parser).
     Lists:   I<TAB>id<TAB>type<TAB>href<TAB>name<TAB>artist<TAB>album<TAB>duration_ms<TAB>track_count<TAB>artwork
              N<TAB>next_offset           (only when there is more)
-    Search:  S<TAB>songs / S<TAB>albums / S<TAB>playlists, each followed by its I lines
+    Sections (search, recommendations): S<TAB>title, each followed by its I lines
     Others:  key=value lines; nested track fields become track_name=..., etc."""
     def item_line(it):
         return "I\t" + "\t".join(clean(it.get(k)) for k in ITEM_FIELDS)
@@ -402,10 +407,10 @@ def to_text(obj):
         lines += [item_line(it) for it in obj["items"]]
         if obj.get("next_offset") is not None:
             lines.append(f"N\t{obj['next_offset']}")
-    elif all(k in obj for k in ("songs", "albums", "playlists")):
-        for k in ("songs", "albums", "playlists"):
-            lines.append(f"S\t{k}")
-            lines += [item_line(it) for it in obj[k]]
+    elif "sections" in obj:
+        for sec in obj["sections"]:
+            lines.append(f"S\t{clean(sec['title'])}")
+            lines += [item_line(it) for it in sec["items"]]
     else:
         for k, v in obj.items():
             if isinstance(v, dict):
@@ -416,7 +421,7 @@ def to_text(obj):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "CiderBridge/0.2"
+    server_version = "CiderBridge/0.3"
     text_mode = False
 
     def log_message(self, fmt, *args):
@@ -469,16 +474,38 @@ class Handler(BaseHTTPRequestHandler):
             if p == "/api/art":
                 return self.art(q.get("u", [""])[0])
             if p == "/api/recent":
-                return self.send_json(simplify_list(cider.amapi("/v1/me/recent/played?limit=25")))
+                off = int(q.get("offset", ["0"])[0])
+                return self.send_json(simplify_list(cider.amapi(f"/v1/me/recent/played?limit=10&offset={off}")))
+            if p.startswith("/api/charts/"):
+                kind = p[len("/api/charts/"):].strip("/")
+                if kind not in CHART_TYPES:
+                    return self.send_json({"error": f"unknown chart '{kind}'"}, 404)
+                off = int(q.get("offset", ["0"])[0])
+                res = cider.amapi(f"/v1/catalog/{CFG['storefront']}/charts?types={kind}&limit=50&offset={off}")
+                charts = (res.get("results") or {}).get(kind) or [{}]
+                return self.send_json(simplify_list(charts[0]))
+            if p == "/api/recommendations":
+                res = cider.amapi("/v1/me/recommendations?limit=10")
+                sections = []
+                for rec in res.get("data", []):
+                    title = ((rec.get("attributes") or {}).get("title") or {}).get("stringForDisplay") or "For You"
+                    items = (((rec.get("relationships") or {}).get("contents") or {}).get("data")) or []
+                    items = [simplify(i) for i in items if (i.get("attributes") or {}).get("name")]
+                    if items:
+                        sections.append({"title": title, "items": items})
+                return self.send_json({"sections": sections})
+            if p.startswith("/api/catalog/"):
+                return self.catalog(p[len("/api/catalog/"):], q)
             if p == "/api/search":
                 term = q.get("q", [""])[0].strip()
                 if not term:
                     return self.send_json({"error": "missing q"}, 400)
-                path = (f"/v1/catalog/{CFG['storefront']}/search?types=songs,albums,playlists&limit=15&term="
-                        + urllib.parse.quote(term))
+                path = (f"/v1/catalog/{CFG['storefront']}/search?types={','.join(k for k, _ in SEARCH_TYPES)}"
+                        f"&limit=15&term=" + urllib.parse.quote(term))
                 res = cider.amapi(path).get("results", {})
-                return self.send_json({k: [simplify(i) for i in (res.get(k) or {}).get("data", [])]
-                                       for k in ("songs", "albums", "playlists")})
+                out = {k: [simplify(i) for i in (res.get(k) or {}).get("data", [])] for k, _ in SEARCH_TYPES}
+                out["sections"] = [{"title": t, "items": out[k]} for k, t in SEARCH_TYPES if out[k]]
+                return self.send_json(out)
             if p.startswith("/api/library/"):
                 return self.library(p[len("/api/library/"):], q)
             return self.send_json({"error": "not found"}, 404)
@@ -527,12 +554,27 @@ class Handler(BaseHTTPRequestHandler):
         if kind not in LIBRARY:
             return self.send_json({"error": f"unknown library section '{kind}'"}, 404)
         if len(parts) == 1:  # e.g. /api/library/playlists
-            path = f"{LIBRARY[kind]}?limit=50&offset={offset}"
+            path = f"{LIBRARY[kind]}?limit={PAGE.get(kind, 50)}&offset={offset}"
         elif len(parts) == 3 and parts[2] == "tracks" and kind in ("playlists", "albums"):
             item_id = urllib.parse.quote(parts[1])
             path = f"{LIBRARY[kind]}/{item_id}/tracks?limit=100&offset={offset}"
         else:
             return self.send_json({"error": "bad library path"}, 404)
+        return self.send_json(simplify_list(cider.amapi(path)))
+
+    def catalog(self, rest, q):
+        """Apple Music catalog (not your library): /api/catalog/albums/<id>/tracks,
+        /api/catalog/playlists/<id>/tracks, /api/catalog/artists/<id>/albums"""
+        offset = int(q.get("offset", ["0"])[0])
+        parts = rest.strip("/").split("/")
+        ok = len(parts) == 3 and ((parts[0] in ("albums", "playlists") and parts[2] == "tracks")
+                                  or (parts[0] == "artists" and parts[2] == "albums"))
+        if not ok:
+            return self.send_json({"error": "bad catalog path"}, 404)
+        item_id = urllib.parse.quote(parts[1])
+        path = f"/v1/catalog/{CFG['storefront']}/{parts[0]}/{item_id}/{parts[2]}?limit=100&offset={offset}"
+        if parts[0] == "artists":
+            path = path.replace("limit=100", "limit=25")
         return self.send_json(simplify_list(cider.amapi(path)))
 
     def art(self, u):

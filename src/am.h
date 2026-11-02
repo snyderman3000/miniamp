@@ -4,11 +4,11 @@
 
 // Apple Music through Cider Bridge (a small service on the user's PC that
 // streams Cider's audio and relays browse/playback commands; see
-// docs/APPLE_MUSIC.md). All network work happens on a background thread;
+// bridge/README.md). All network work happens on a background thread;
 // these calls never block the UI.
 
 typedef struct {
-    char id[96], type[48], href[256];
+    char id[96], type[48], href[256];   // type "_section": a heading, not an item
     char name[200], artist[160], album[160];
     char art[400];          // bridge path for the artwork, "" if none
     int dur_ms, tracks;
@@ -49,7 +49,7 @@ void am_play_item(const am_item *it);
 void am_pause_now(void);
 
 // Lists. Slots are independent views (0..AM_SLOTS-1) filled in the background.
-#define AM_SLOTS 3
+#define AM_SLOTS 4
 void am_list_load(int slot, const char *api_path);    // e.g. "/api/library/playlists"
 void am_list_more(int slot);                          // next page, if any
 void am_list_clear(int slot);

@@ -30,7 +30,7 @@
 enum { K_UP = 103, K_DOWN = 108, K_LEFT = 105, K_RIGHT = 106, K_A = 57, K_B = 29, K_X = 42, K_Y = 56,
        K_L = 18, K_R = 20, K_L2 = 15, K_R2 = 14, K_START = 28, K_SELECT = 97, K_MENU = 1, K_POWER = 116 };
 
-enum { SCR_PLAYLIST, SCR_EQ, SCR_BROWSER, SCR_OPTIONS, SCR_SKINS, SCR_VIS, SCR_PRESETS, SCR_AM };
+enum { SCR_PLAYLIST, SCR_EQ, SCR_BROWSER, SCR_OPTIONS, SCR_SKINS, SCR_VIS, SCR_PRESETS, SCR_AM, SCR_KB };
 
 // ---------------------------------------------------------------- state
 static m2d_surf *bb;
@@ -946,22 +946,47 @@ static void draw_browser(void)
 }
 
 // ---------------------------------------------------------------- Apple Music
-// The home screen, a list (playlists, albums...), and the tracks of one of them.
-enum { AMV_HOME, AMV_LIST, AMV_TRACKS };
-typedef struct { int kind; char title[160]; am_item parent; int sel, scroll; } am_view;
-static am_view amv[3];
-static int am_depth;
+// Menus are built in (home, What's new); lists come from the bridge (playlists,
+// search results...); a tracks view shows what's in an album or playlist.
+enum { AMV_MENU, AMV_LIST, AMV_TRACKS };
+enum { ACT_NOWPLAYING, ACT_SEARCH, ACT_MENU, ACT_LIST, ACT_TRACKS, ACT_SD };
+typedef struct am_menu am_menu;
+typedef struct {
+    const char *label, *sub;
+    int act;
+    const char *path;          // ACT_LIST / ACT_TRACKS: what to load
+    const am_menu *menu;       // ACT_MENU
+    const char *type, *id;     // ACT_TRACKS: the album/playlist itself, for "play all"
+} am_entry;
+struct am_menu { const char *title; const am_entry *e; int n; };
 
-typedef struct { const char *label, *sub, *path; } am_home_entry;
-static const am_home_entry AM_HOME[] = {
-    { "Now playing in Cider", "Listen to whatever your PC is playing", NULL },
-    { "Recently played", NULL, "/api/recent" },
-    { "Playlists", NULL, "/api/library/playlists" },
-    { "Albums", NULL, "/api/library/albums" },
-    { "Songs", NULL, "/api/library/songs" },
-    { "Music on this SD card", "Back to your own files", NULL },
+// Apple's "New Music Daily" playlist (catalog playlist ids are the same in every country)
+#define AM_NMD "pl.2b0e6e332fdf4b7a91164da3162127b5"
+static const am_entry AM_NEW_E[] = {
+    { "New Music Daily", "Apple's daily playlist of new songs", ACT_TRACKS, "/api/catalog/playlists/" AM_NMD "/tracks", NULL, "playlists", AM_NMD },
+    { "Top songs", "What's popular right now", ACT_LIST, "/api/charts/songs", NULL, NULL, NULL },
+    { "Top albums", "What's popular right now", ACT_LIST, "/api/charts/albums", NULL, NULL, NULL },
+    { "Top playlists", "Apple's chart playlists", ACT_LIST, "/api/charts/playlists", NULL, NULL, NULL },
+    { "Made for you", "Your Apple Music recommendations", ACT_LIST, "/api/recommendations", NULL, NULL, NULL },
 };
-#define AM_HOME_N ((int)(sizeof AM_HOME / sizeof AM_HOME[0]))
+static const am_menu AM_NEW = { "What's new", AM_NEW_E, (int)(sizeof AM_NEW_E / sizeof AM_NEW_E[0]) };
+static const am_entry AM_HOME_E[] = {
+    { "Now playing in Cider", "Listen to whatever your PC is playing", ACT_NOWPLAYING, NULL, NULL, NULL, NULL },
+    { "Search", "Songs, albums, artists, playlists", ACT_SEARCH, NULL, NULL, NULL, NULL },
+    { "What's new", "New music, charts, made for you", ACT_MENU, NULL, &AM_NEW, NULL, NULL },
+    { "Recently played", NULL, ACT_LIST, "/api/recent", NULL, NULL, NULL },
+    { "Playlists", NULL, ACT_LIST, "/api/library/playlists", NULL, NULL, NULL },
+    { "Albums", NULL, ACT_LIST, "/api/library/albums", NULL, NULL, NULL },
+    { "Songs", NULL, ACT_LIST, "/api/library/songs", NULL, NULL, NULL },
+    { "Recently added", "New in your library", ACT_LIST, "/api/library/recently-added", NULL, NULL, NULL },
+    { "Music on this SD card", "Back to your own files", ACT_SD, NULL, NULL, NULL, NULL },
+};
+static const am_menu AM_HOME = { "Apple Music", AM_HOME_E, (int)(sizeof AM_HOME_E / sizeof AM_HOME_E[0]) };
+
+#define AM_MAXDEPTH 4
+typedef struct { int kind; char title[160]; am_item parent; const am_menu *menu; int sel, scroll; } am_view;
+static am_view amv[AM_MAXDEPTH + 1] = { { AMV_MENU, "", { { 0 } }, &AM_HOME, 0, 0 } };
+static int am_depth;
 
 static int am_pos_ms(void)
 {
@@ -998,10 +1023,39 @@ static void am_begin(int wait_for_pc)
     else am_restart_stream();
 }
 
-static int am_is_song(const am_item *it) { return strstr(it->type, "song") != NULL; }
-static int am_is_library_list(const am_item *it)
+static void url_escape(char *out, int n, const char *s)
 {
-    return !strcmp(it->type, "library-playlists") || !strcmp(it->type, "library-albums");
+    static const char hex[] = "0123456789ABCDEF";
+    int o = 0;
+    for (; *s && o < n - 4; s++) {
+        unsigned char c = (unsigned char)*s;
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_' || c == '~') out[o++] = (char)c;
+        else { out[o++] = '%'; out[o++] = hex[c >> 4]; out[o++] = hex[c & 15]; }
+    }
+    out[o] = 0;
+}
+
+static int am_is_song(const am_item *it) { return strstr(it->type, "song") != NULL; }
+static int am_is_section(const am_item *it) { return !strcmp(it->type, "_section"); }
+
+// where opening a container leads: fills path, returns the view kind (0 = it just plays)
+static int am_open_path(const am_item *it, char *path, int n)
+{
+    char id[200];
+    url_escape(id, sizeof id, it->id);
+    if (!strcmp(it->type, "library-playlists") || !strcmp(it->type, "library-albums")) {
+        snprintf(path, n, "/api/library/%s/%s/tracks", strstr(it->type, "album") ? "albums" : "playlists", id);
+        return AMV_TRACKS;
+    }
+    if (!strcmp(it->type, "albums") || !strcmp(it->type, "playlists")) {
+        snprintf(path, n, "/api/catalog/%s/%s/tracks", it->type, id);
+        return AMV_TRACKS;
+    }
+    if (!strcmp(it->type, "artists")) {
+        snprintf(path, n, "/api/catalog/artists/%s/albums", id);
+        return AMV_LIST;
+    }
+    return 0;
 }
 
 static void am_play(const am_item *it)
@@ -1018,66 +1072,110 @@ static void am_open(void)
     screen = SCR_AM;
 }
 
-static void url_escape(char *out, int n, const char *s)
+static void am_push(int kind, const char *title, const am_item *parent, const char *path, const am_menu *menu)
 {
-    static const char hex[] = "0123456789ABCDEF";
-    int o = 0;
-    for (; *s && o < n - 4; s++) {
-        unsigned char c = (unsigned char)*s;
-        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_' || c == '~') out[o++] = (char)c;
-        else { out[o++] = '%'; out[o++] = hex[c >> 4]; out[o++] = hex[c & 15]; }
-    }
-    out[o] = 0;
-}
-
-static void am_push(int kind, const char *title, const am_item *parent, const char *path)
-{
-    if (am_depth >= 2) return;
+    if (am_depth >= AM_MAXDEPTH) return;
     am_depth++;
     am_view *v = &amv[am_depth];
     memset(v, 0, sizeof *v);
     v->kind = kind;
+    v->menu = menu;
     snprintf(v->title, sizeof v->title, "%s", title);
     if (parent) v->parent = *parent;
-    am_list_load(am_depth - 1, path);
+    if (kind != AMV_MENU) am_list_load(am_depth - 1, path);
 }
+
+static int am_view_count(const am_view *v)
+{
+    return v->kind == AMV_MENU ? v->menu->n : am_list_count(am_depth - 1);
+}
+
+static int am_row_is_section(const am_view *v, int i)
+{
+    if (v->kind == AMV_MENU) return 0;
+    am_item it;
+    return am_list_get(am_depth - 1, i, &it) && am_is_section(&it);
+}
+
+// moves the cursor, stepping over section headings
+static void am_move(am_view *v, int delta, int wrap)
+{
+    int n = am_view_count(v);
+    if (!n) return;
+    int s = v->sel + delta;
+    if (wrap) s = (s % n + n) % n;
+    else s = s < 0 ? 0 : s >= n ? n - 1 : s;
+    int dir = delta < 0 ? -1 : 1;
+    for (int k = 0; k < n && am_row_is_section(v, s); k++) {
+        int t = s + dir;
+        if (wrap) t = (t % n + n) % n;
+        else if (t < 0 || t >= n) { dir = -dir; t = s + dir; if (t < 0 || t >= n) break; }
+        s = t;
+    }
+    v->sel = s;
+}
+
+static void kb_open(void);
 
 static void am_activate(int play_all)
 {
     am_view *v = &amv[am_depth];
-    if (v->kind == AMV_HOME) {
-        const am_home_entry *e = &AM_HOME[v->sel];
-        if (v->sel == 0) {
-            if (!ams.found) { am_rediscover(); show_toast("%s", "Looking for Cider Bridge..."); return; }
+    char path[400];
+    if (v->kind == AMV_MENU) {
+        const am_entry *e = &v->menu->e[v->sel];
+        if (e->act != ACT_SD && e->act != ACT_MENU && !ams.found) {
+            am_rediscover();
+            show_toast("%s", "Looking for Cider Bridge...");
+            return;
+        }
+        switch (e->act) {
+        case ACT_NOWPLAYING:
             am_begin(0);
             screen = panel = SCR_PLAYLIST;
             show_toast("%s", "Listening to Cider");
-        } else if (!e->path) {
+            break;
+        case ACT_SEARCH: kb_open(); break;
+        case ACT_MENU: am_push(AMV_MENU, e->label, NULL, NULL, e->menu); break;
+        case ACT_LIST: if (!play_all) am_push(AMV_LIST, e->label, NULL, e->path, NULL); break;
+        case ACT_TRACKS: {
+            am_item parent;
+            memset(&parent, 0, sizeof parent);
+            snprintf(parent.type, sizeof parent.type, "%s", e->type);
+            snprintf(parent.id, sizeof parent.id, "%s", e->id);
+            snprintf(parent.name, sizeof parent.name, "%s", e->label);
+            if (play_all) am_play(&parent);
+            else am_push(AMV_TRACKS, e->label, &parent, e->path, NULL);
+            break;
+        }
+        case ACT_SD:
             am_leave();
             audio_stop();
             open_browser();
-        } else am_push(AMV_LIST, e->label, NULL, e->path);
+            break;
+        }
         return;
     }
     int slot = am_depth - 1;
     if (play_all && v->kind == AMV_TRACKS) { am_play(&v->parent); return; }
     am_item it;
-    if (!am_list_get(slot, v->sel, &it)) return;
-    if (!play_all && !am_is_song(&it) && am_is_library_list(&it)) {
-        char id[200], path[300];
-        url_escape(id, sizeof id, it.id);
-        snprintf(path, sizeof path, "/api/library/%s/%s/tracks", strstr(it.type, "album") ? "albums" : "playlists", id);
-        am_push(AMV_TRACKS, it.name, &it, path);
-        return;
-    }
+    if (!am_list_get(slot, v->sel, &it) || am_is_section(&it)) return;
+    int kind = am_open_path(&it, path, sizeof path);
+    if (play_all && kind == AMV_LIST) { show_toast("%s", "Open the artist to pick an album"); return; }
+    if (!play_all && kind) { am_push(kind, it.name, &it, path, NULL); return; }
     am_play(&it);
 }
 
 static void am_back(void)
 {
     if (am_depth == 0) { screen = panel; return; }
-    am_list_clear(am_depth - 1);
+    if (amv[am_depth].kind != AMV_MENU) am_list_clear(am_depth - 1);
     am_depth--;
+}
+
+static void search_icon(int x, int cy, uint32_t c)
+{
+    m2d_circle(bb, x + 7, cy - 2, 6, c, M2D_ALPHA, 0, 2);
+    m2d_line(bb, x + 11, cy + 2, x + 16, cy + 7, 2, c, M2D_ALPHA);
 }
 
 static void draw_am_browser(void)
@@ -1088,7 +1186,7 @@ static void draw_am_browser(void)
     fill(0, 50, SCREEN_W, 1, C_LINE);
     font_draw_mid(bb, f_title, 20, 25, "APPLE MUSIC", accent());
     char right[200], fit[200];
-    if (v->kind == AMV_HOME) {
+    if (am_depth == 0) {
         if (ams.searching) snprintf(right, sizeof right, "looking for your PC...");
         else if (!ams.found) snprintf(right, sizeof right, "PC not found");
         else if (!ams.cider) snprintf(right, sizeof right, "Cider isn't open");
@@ -1098,10 +1196,8 @@ static void draw_am_browser(void)
     font_draw_mid(bb, f_small, SCREEN_W - 20 - font_width(f_small, fit), 25, fit, C_DIM);
 
     uint32_t acc = accent();
-    int n, slot = am_depth - 1;
-    if (v->kind == AMV_HOME) n = AM_HOME_N;
-    else {
-        n = am_list_count(slot);
+    int n = am_view_count(v), slot = am_depth - 1;
+    if (v->kind != AMV_MENU) {
         int more;
         char err[160];
         int loading = am_list_state(slot, &more, err, sizeof err);
@@ -1110,35 +1206,57 @@ static void draw_am_browser(void)
             font_draw_mid(bb, f_mid, (SCREEN_W - font_width(f_mid, t)) / 2, 200, t, C_DIM);
         }
         if (more && !loading && v->sel >= n - 6) am_list_more(slot);
+        if (v->sel == 0 && n > 1 && am_row_is_section(v, 0)) am_move(v, 1, 0);   // start on the first real row
     }
     if (v->sel >= n) v->sel = n ? n - 1 : 0;
     if (v->sel < v->scroll) v->scroll = v->sel;
     if (v->sel >= v->scroll + B_ROWS) v->scroll = v->sel - B_ROWS + 1;
+    if (v->scroll == 1 && am_row_is_section(v, 0)) v->scroll = 0;   // keep the first heading in view
     for (int r = 0; r < B_ROWS && v->scroll + r < n; r++) {
         int i = v->scroll + r, y = B_TOP + r * B_ROWH, cy = y + B_ROWH / 2 - 1;
-        if (i == v->sel) rrect(10, y, SCREEN_W - 20, B_ROWH - 2, 8, C_SEL);
         char nm[400], sub[200];
-        if (v->kind == AMV_HOME) {
-            const am_home_entry *e = &AM_HOME[i];
-            if (i == 0) font_draw_mid(bb, f_mid, 26, cy, "▶", C_GREEN);
-            else if (!e->path) folder_icon(24, cy, C_DIM);
-            else folder_icon(24, cy, acc);
+        if (v->kind == AMV_MENU) {
+            const am_entry *e = &v->menu->e[i];
+            if (i == v->sel) rrect(10, y, SCREEN_W - 20, B_ROWH - 2, 8, C_SEL);
+            if (e->act == ACT_NOWPLAYING) font_draw_mid(bb, f_mid, 26, cy, "▶", C_GREEN);
+            else if (e->act == ACT_SEARCH) search_icon(24, cy, acc);
+            else if (e->act == ACT_TRACKS) font_draw_mid(bb, f_mid, 26, cy, "≡", C_GREEN);
+            else folder_icon(24, cy, e->act == ACT_SD ? C_DIM : acc);
             font_draw_mid(bb, f_mid, 54, cy, e->label, C_TEXT);
+            int rx = SCREEN_W - 26;
+            if (e->act == ACT_MENU) {
+                font_draw_mid(bb, f_mid, rx - font_width(f_mid, "›"), cy, "›", C_DIM);
+                rx -= 22;
+            }
             if (e->sub && i == v->sel) {
-                font_fit(f_small, e->sub, 260, sub, sizeof sub);
-                font_draw_mid(bb, f_small, SCREEN_W - 26 - font_width(f_small, sub), cy, sub, C_DIM);
+                font_fit(f_small, e->sub, 300, sub, sizeof sub);
+                font_draw_mid(bb, f_small, rx - font_width(f_small, sub), cy, sub, C_DIM);
             }
             continue;
         }
         am_item it;
         if (!am_list_get(slot, i, &it)) break;
+        if (am_is_section(&it)) {
+            char up[200];
+            int k = 0;
+            for (const char *c = it.name; *c && k < (int)sizeof up - 1; c++) up[k++] = (*c >= 'a' && *c <= 'z') ? *c - 32 : *c;
+            up[k] = 0;
+            font_fit(f_head, up, SCREEN_W - 60, nm, sizeof nm);
+            font_draw_mid(bb, f_head, 22, cy + 3, nm, acc);
+            fill(30 + font_width(f_head, nm), cy + 3, SCREEN_W - 56 - font_width(f_head, nm), 1, C_LINE);
+            continue;
+        }
+        if (i == v->sel) rrect(10, y, SCREEN_W - 20, B_ROWH - 2, 8, C_SEL);
         int song = am_is_song(&it);
+        int artist = !strcmp(it.type, "artists");
         if (song) font_draw_mid(bb, f_mid, 26, cy, "♪", C_DIM);
         else if (strstr(it.type, "playlist")) font_draw_mid(bb, f_mid, 26, cy, "≡", C_GREEN);
+        else if (artist) { m2d_circle(bb, 33, cy - 4, 4, acc, M2D_ALPHA, 1, 0); fill(26, cy + 2, 15, 6, acc); }
         else folder_icon(24, cy, acc);
         char right2[64] = "";
         if (song && it.dur_ms > 0) fmt_time(right2, sizeof right2, it.dur_ms);
         else if (it.tracks > 0) snprintf(right2, sizeof right2, "%d", it.tracks);
+        else if (artist) snprintf(right2, sizeof right2, "›");
         int rw = right2[0] ? font_width(f_key, right2) + 16 : 0;
         int avail = SCREEN_W - 54 - 26 - rw;
         font_fit(f_mid, it.name, it.artist[0] ? avail * 6 / 10 : avail, nm, sizeof nm);
@@ -1226,7 +1344,7 @@ static void draw_am_panel(void)
 static void am_update(void)
 {
     static int was_active = -1;
-    int act = am_mode || screen == SCR_AM;
+    int act = am_mode || screen == SCR_AM || screen == SCR_KB;
     if (act != was_active) { am_set_active(act); was_active = act; }
     if (!act) return;
     am_get_status(&ams);
@@ -1249,6 +1367,106 @@ static void am_update(void)
     // hear the tail of the old track that's still in our buffer
     if (ams.generation != am_gen) am_restart_stream();
     else if (am_retry_at > 0 && now_t >= am_retry_at) am_restart_stream();
+}
+
+// ---------------------------------------------------------------- search keyboard
+static char kb_text[64];
+static int kb_r = 1, kb_c;
+static const char *KB_KEYS[4] = { "1234567890", "qwertyuiop", "asdfghjkl'", "zxcvbnm,.-" };
+// bottom row: SPACE (columns 0-4), DELETE (5-6), SEARCH (7-9)
+static int kb_group(int c) { return c < 5 ? 0 : c < 7 ? 1 : 2; }
+static const int KB_G0[3] = { 0, 5, 7 }, KB_GN[3] = { 5, 2, 3 };
+
+static void kb_open(void) { screen = SCR_KB; }
+
+static void kb_backspace(void)
+{
+    int n = (int)strlen(kb_text);
+    while (n > 0 && ((unsigned char)kb_text[n - 1] & 0xC0) == 0x80) n--;   // whole UTF-8 characters
+    if (n > 0) n--;
+    kb_text[n] = 0;
+}
+
+static void kb_type(char c)
+{
+    int n = (int)strlen(kb_text);
+    if (n < (int)sizeof kb_text - 1) { kb_text[n] = c; kb_text[n + 1] = 0; }
+}
+
+static void kb_submit(void)
+{
+    // trim spaces at both ends
+    char t[64];
+    const char *a = kb_text;
+    while (*a == ' ') a++;
+    snprintf(t, sizeof t, "%s", a);
+    int n = (int)strlen(t);
+    while (n > 0 && t[n - 1] == ' ') t[--n] = 0;
+    if (!n) { show_toast("%s", "Type something to search for"); return; }
+    char q[200], path[300], title[120];
+    url_escape(q, sizeof q, t);
+    snprintf(path, sizeof path, "/api/search?q=%s", q);
+    snprintf(title, sizeof title, "Search: %s", t);
+    screen = SCR_AM;
+    am_push(AMV_LIST, title, NULL, path, NULL);
+}
+
+static void kb_key(int k, int repeat)
+{
+    if (k == K_UP) kb_r = (kb_r + 4) % 5;
+    else if (k == K_DOWN) kb_r = (kb_r + 1) % 5;
+    else if (k == K_LEFT || k == K_RIGHT) {
+        int d = k == K_LEFT ? -1 : 1;
+        if (kb_r == 4) {   // the wide keys move as one
+            int g = (kb_group(kb_c) + d + 3) % 3;
+            kb_c = KB_G0[g];
+        } else kb_c = (kb_c + d + 10) % 10;
+    }
+    else if (repeat) return;
+    else if (k == K_A) {
+        if (kb_r < 4) kb_type(KB_KEYS[kb_r][kb_c]);
+        else if (kb_group(kb_c) == 0) kb_type(' ');
+        else if (kb_group(kb_c) == 1) kb_backspace();
+        else kb_submit();
+    }
+    else if (k == K_B) { if (kb_text[0]) kb_backspace(); else screen = SCR_AM; }
+    else if (k == K_Y) kb_type(' ');
+    else if (k == K_X) kb_text[0] = 0;
+    else if (k == K_START) kb_submit();
+    else if (k == K_SELECT || k == K_MENU) screen = SCR_AM;
+}
+
+static void draw_kb(void)
+{
+    const int x = 60, y = 64, w = 520, h = 330;
+    card(x, y, w, h, "SEARCH");
+    font_draw_mid(bb, f_small, x + w - 24 - font_width(f_small, "Apple Music catalog"), y + 26, "Apple Music catalog", C_DIM);
+    // text field
+    int fx = x + 24, fy = y + 52, fw = w - 48, fh = 40;
+    rrect(fx, fy, fw, fh, 8, 0xff0b0d11u);
+    char shown[80];
+    font_fit_left(f_mid, kb_text, fw - 30, shown, sizeof shown);
+    font_draw_mid(bb, f_mid, fx + 14, fy + fh / 2, kb_text[0] ? shown : "", C_TEXT);
+    if (!kb_text[0]) font_draw_mid(bb, f_mid, fx + 14, fy + fh / 2, "Song, album, artist...", C_DIM);
+    if (fmod(now_t, 1.0) < 0.6) fill(fx + 14 + (kb_text[0] ? font_width(f_mid, shown) : 0) + 2, fy + 10, 2, fh - 20, accent());
+    // keys
+    const int kw = 46, kh = 38, gap = 4, kx = x + (w - (10 * kw + 9 * gap)) / 2, ky = fy + fh + 18;
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 10; c++) {
+            int bx = kx + c * (kw + gap), by = ky + r * (kh + gap);
+            int on = r == kb_r && c == kb_c;
+            rrect(bx, by, kw, kh, 6, on ? accent() : C_KEY);
+            char t[2] = { KB_KEYS[r][c], 0 };
+            font_draw_mid(bb, f_mid, bx + (kw - font_width(f_mid, t)) / 2, by + kh / 2, t, on ? 0xff101216u : C_TEXT);
+        }
+    static const char *labels[3] = { "SPACE", "DELETE", "SEARCH" };
+    for (int g = 0; g < 3; g++) {
+        int bx = kx + KB_G0[g] * (kw + gap), bw = KB_GN[g] * kw + (KB_GN[g] - 1) * gap, by = ky + 4 * (kh + gap);
+        int on = kb_r == 4 && kb_group(kb_c) == g;
+        uint32_t bg = on ? accent() : g == 2 ? C_GREENBG : C_KEY;
+        rrect(bx, by, bw, kh, 6, bg);
+        font_draw_mid(bb, f_key, bx + (bw - font_width(f_key, labels[g])) / 2, by + kh / 2, labels[g], on ? 0xff101216u : g == 2 ? C_GREEN : C_TEXT);
+    }
 }
 
 static void am_seek_by(int delta_ms)
@@ -1342,19 +1560,21 @@ static void on_key(int k, int repeat)
         else if ((k == K_B || k == K_MENU) && !repeat) close_skins(0);
         return;
     }
+    if (screen == SCR_KB) { kb_key(k, repeat); return; }
     if (screen == SCR_AM) {
         am_view *v = &amv[am_depth];
-        int n = v->kind == AMV_HOME ? AM_HOME_N : am_list_count(am_depth - 1);
-        if (k == K_UP && n) v->sel = (v->sel + n - 1) % n;
-        else if (k == K_DOWN && n) v->sel = (v->sel + 1) % n;
-        else if (k == K_L2 || k == K_LEFT) v->sel = v->sel - B_ROWS < 0 ? 0 : v->sel - B_ROWS;
-        else if (k == K_R2 || k == K_RIGHT) v->sel = n ? (v->sel + B_ROWS >= n ? n - 1 : v->sel + B_ROWS) : 0;
+        int n = am_view_count(v);
+        if (k == K_UP) am_move(v, -1, 1);
+        else if (k == K_DOWN) am_move(v, 1, 1);
+        else if (k == K_L2 || k == K_LEFT) am_move(v, -B_ROWS, 0);
+        else if (k == K_R2 || k == K_RIGHT) am_move(v, B_ROWS, 0);
         else if (repeat) return;
         else if (k == K_A && n) am_activate(0);
         else if (k == K_Y) {
             if (!ams.found) { am_rediscover(); show_toast("%s", "Looking for Cider Bridge..."); }
-            else if (v->kind != AMV_HOME && n) am_activate(1);
+            else if (n) am_activate(1);
         }
+        else if (k == K_X && am_depth == 0) kb_open();
         else if (k == K_B) am_back();
         else if (k == K_START) toggle_pause();
         else if (k == K_SELECT || k == K_MENU) screen = panel;
@@ -1454,11 +1674,21 @@ static void on_key(int k, int repeat)
 static void draw_frame(void)
 {
     bb = m2d_backbuffer();
-    if (screen == SCR_AM) {
+    if (screen == SCR_KB) {
         draw_am_browser();
-        if (amv[am_depth].kind == AMV_HOME) {
-            hint h[] = { { "A", "Open" }, { "B", "Back" } };
-            hint_bar(h, 2);
+        draw_kb();
+        hint h[] = { { "A", "Type" }, { "B", "Delete" }, { "Y", "Space" }, { "X", "Clear" }, { "START", "Search" } };
+        hint_bar(h, 5);
+    } else if (screen == SCR_AM) {
+        draw_am_browser();
+        if (amv[am_depth].kind == AMV_MENU) {
+            hint home[] = { { "A", "Open" }, { "X", "Search" }, { "B", "Back" } };
+            hint sub[] = { { "A", "Open" }, { "Y", "Play" }, { "B", "Back" } };
+            const am_view *mv = &amv[am_depth];
+            int can_play = mv->menu->e[mv->sel].act == ACT_TRACKS;
+            if (am_depth == 0) hint_bar(home, 3);
+            else if (can_play) hint_bar(sub, 3);
+            else { hint h2[] = { { "A", "Open" }, { "B", "Back" } }; hint_bar(h2, 2); }
         } else {
             hint h[] = { { "A", "Open / Play" }, { "Y", "Play all" }, { "B", "Back" } };
             hint_bar(h, 3);
@@ -1507,7 +1737,7 @@ static void draw_frame(void)
     }
     if (toast_until > now_t) {
         int w = font_width(f_mid, toast) + 36;
-        int x = (SCREEN_W - w) / 2, y = screen == SCR_BROWSER || screen == SCR_AM ? 370 : screen == SCR_OPTIONS ? 443 : 396;
+        int x = (SCREEN_W - w) / 2, y = screen == SCR_BROWSER || screen == SCR_AM || screen == SCR_KB ? 370 : screen == SCR_OPTIONS ? 443 : 396;
         rrect(x, y, w, 34, 17, 0xf0262b36u);
         font_draw_mid(bb, f_mid, x + 18, y + 17, toast, C_TEXT);
     }

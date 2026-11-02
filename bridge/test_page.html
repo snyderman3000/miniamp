@@ -123,7 +123,7 @@ $('#q').onkeydown = async e => {
   if (e.key !== 'Enter') return;
   try {
     const r = await api('/api/search?q=' + encodeURIComponent($('#q').value));
-    render([...r.songs, ...r.albums, ...r.playlists], 'Songs, albums, playlists');
+    render([...r.songs, ...r.albums, ...(r.artists || []), ...r.playlists], 'Songs, albums, artists, playlists');
   } catch (err) { $('#list').innerHTML = `<div class=err>${err.message}</div>`; }
 };
 </script>
