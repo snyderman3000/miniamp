@@ -11,6 +11,9 @@ A classic-skin music player for the **Miyoo Mini Plus** (OnionOS).
 - Spectrum / oscilloscope in the main window, five full-screen visualizers
 - Music library browser, playlists (`.m3u`), shuffle, repeat, sleep timer
 - Screen-off playback
+- **Internet radio** through the same PC bridge: search about 50,000 stations from
+  [Radio Browser](https://www.radio-browser.info), favorites, genres and song titles;
+  any format (MP3, AAC, HTTPS, HLS) plays, because the bridge converts it
 - **Apple Music** through [Cider](https://cider.sh) on your PC: browse your library,
   search the catalog, see what's new and hear it on the handheld, streamed over Wi-Fi
   (see below)

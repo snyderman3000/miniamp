@@ -21,6 +21,8 @@ static pthread_t thr;
 static pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
 static int running, active, kick;
+static int radio_on;                 // poll radio status instead of Cider's
+static am_radio rs;                  // under mtx
 static char cfg_path[700];
 
 static am_status st;                 // under mtx
@@ -205,8 +207,38 @@ static void apply_status(char *text, int full)
     pthread_mutex_unlock(&mtx);
 }
 
+static void poll_radio(void)
+{
+    char *t = request("GET", "/api/radio/status?fmt=text", NULL);
+    if (!t) return;
+    am_radio n;
+    memset(&n, 0, sizeof n);
+    char art[400] = "";
+    char *save = NULL;
+    for (char *line = strtok_r(t, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = 0;
+        const char *k = line, *v = eq + 1;
+        if (!strcmp(k, "active")) n.active = atoi(v);
+        else if (!strcmp(k, "name")) copy_utf8(n.name, sizeof n.name, v);
+        else if (!strcmp(k, "title")) copy_utf8(n.title, sizeof n.title, v);
+        else if (!strcmp(k, "where")) copy_utf8(n.where, sizeof n.where, v);
+        else if (!strcmp(k, "format")) copy_utf8(n.format, sizeof n.format, v);
+        else if (!strcmp(k, "error")) copy_utf8(n.error, sizeof n.error, v);
+        else if (!strcmp(k, "titles")) n.titles = atoi(v);
+        else if (!strcmp(k, "artwork")) copy_utf8(art, sizeof art, v);
+    }
+    free(t);
+    pthread_mutex_lock(&mtx);
+    rs = n;
+    if (radio_on) snprintf(art_path, sizeof art_path, "%s", art);
+    pthread_mutex_unlock(&mtx);
+}
+
 static void poll_status(void)
 {
+    if (radio_on) { poll_radio(); return; }
     char *t = request("GET", "/api/status?fmt=text", NULL);
     if (t) { apply_status(t, 1); free(t); }
 }
@@ -423,6 +455,43 @@ void am_set_active(int on)
     pthread_mutex_unlock(&mtx);
 }
 
+void am_set_radio(int on)
+{
+    pthread_mutex_lock(&mtx);
+    if (on != radio_on) {
+        radio_on = on;
+        memset(&rs, 0, sizeof rs);
+        art_path[0] = 0;
+        next_poll = 0;
+        wake();
+    }
+    pthread_mutex_unlock(&mtx);
+}
+
+void am_get_radio(am_radio *out)
+{
+    pthread_mutex_lock(&mtx);
+    *out = rs;
+    pthread_mutex_unlock(&mtx);
+}
+
+int am_radio_url(const char *uuid, char *out, int n)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    char e[300];
+    int o = 0;
+    for (const unsigned char *c = (const unsigned char *)uuid; *c && o < (int)sizeof e - 4; c++) {
+        if ((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9') || *c == '-' || *c == '_' || *c == '.') e[o++] = (char)*c;
+        else { e[o++] = '%'; e[o++] = hex[*c >> 4]; e[o++] = hex[*c & 15]; }
+    }
+    e[o] = 0;
+    pthread_mutex_lock(&mtx);
+    int ok = found;
+    if (ok) snprintf(out, n, "http://%s:%d/radio.mp3?uuid=%s", host, port, e);
+    pthread_mutex_unlock(&mtx);
+    return ok;
+}
+
 void am_get_status(am_status *out)
 {
     pthread_mutex_lock(&mtx);
@@ -506,6 +575,14 @@ void am_play_item(const am_item *it)
     push("/api/play_item?fmt=text", b);
 }
 
+void am_radio_fav(const char *uuid)
+{
+    char b[300], u[260];
+    json_str(u, sizeof u, uuid);
+    snprintf(b, sizeof b, "{\"uuid\": %s}", u);
+    push("/api/radio/favorite?fmt=text", b);
+}
+
 void am_pause_now(void)
 {
     char h[64];
@@ -582,6 +659,14 @@ int am_list_get(int slot, int i, am_item *out)
     if (ok) *out = L[slot].items[i];
     pthread_mutex_unlock(&mtx);
     return ok;
+}
+
+void am_list_set(int slot, int i, const am_item *it)
+{
+    if (slot < 0 || slot >= AM_SLOTS) return;
+    pthread_mutex_lock(&mtx);
+    if (i >= 0 && i < L[slot].n) L[slot].items[i] = *it;
+    pthread_mutex_unlock(&mtx);
 }
 
 int am_list_state(int slot, int *more, char *err, int errn)

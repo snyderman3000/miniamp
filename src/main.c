@@ -68,6 +68,18 @@ static double am_seek_due;        // seeking is sent once the button is let go
 static int am_seek_target;        // ms
 #define AM_DELAY_MS 1100          // what you hear is about this far behind Cider
 
+// Internet radio (also through Cider Bridge, which fetches the station)
+static int radio_mode;            // a radio station is the source
+static int radio_paused;          // live radio "pause" = disconnected; resuming rejoins live
+static am_item radio_cur;         // the station
+static am_item *radio_list;       // the list it was picked from, for L/R
+static int radio_n, radio_idx;
+static double radio_started;      // when we (re)connected
+static double radio_tuned_at;     // when this station was picked (shown as listening time)
+static double radio_retry_at;
+static int radio_fails;           // quick failures in a row
+static am_radio rad;              // refreshed every frame while radio plays
+
 static double now(void)
 {
     struct timespec ts;
@@ -100,6 +112,7 @@ static void press_flash(int b) { pressed = b; pressed_until = now_t + 0.18; }
 #define C_SEL 0xff1f2a48u
 #define C_GREEN 0xff5fd38du
 #define C_GREENBG 0xff1d3a2cu
+#define C_GOLD 0xfff5c542u
 
 static int luma(uint32_t c) { return (int)(((c >> 16) & 255) * 0.3 + ((c >> 8) & 255) * 0.59 + (c & 255) * 0.11); }
 
@@ -176,6 +189,11 @@ static int am_pos_ms(void);
 static void update_marquee(void)
 {
     pl_item it;
+    if (radio_mode) {
+        if (rad.title[0]) snprintf(marquee, sizeof marquee, "%s: %s  ***  ", radio_cur.name, rad.title);
+        else snprintf(marquee, sizeof marquee, "%s  ***  INTERNET RADIO  ***  ", radio_cur.name);
+        return;
+    }
     if (am_mode) {
         if (!ams.found) snprintf(marquee, sizeof marquee, "%s  ***  ", ams.searching ? "LOOKING FOR CIDER BRIDGE ON YOUR NETWORK..." : "CAN'T FIND CIDER BRIDGE - IS IT RUNNING ON YOUR PC?");
         else if (!ams.cider) snprintf(marquee, sizeof marquee, "CIDER ISN'T OPEN ON YOUR PC  ***  ");
@@ -207,14 +225,77 @@ static void am_leave(void)
     am_cmd("pause");
 }
 
+static void radio_leave(void)
+{
+    if (!radio_mode) return;
+    radio_mode = 0;
+    radio_paused = 0;
+    radio_retry_at = 0;
+    am_set_radio(0);
+}
+
 static void play_index(int i, int start_ms, int paused)
 {
     am_leave();
+    radio_leave();
     if (core_play_index(i, start_ms, paused)) marquee_t0 = now_t;
+}
+
+// (re)connects to the current station: radio never resumes where it left off
+static void radio_connect(void)
+{
+    char url[400];
+    radio_retry_at = 0;
+    if (!am_radio_url(radio_cur.id, url, sizeof url)) { radio_retry_at = now_t + 2; return; }
+    audio_play_file(url, 0, 0);
+    radio_started = now_t;
+    radio_paused = 0;
+}
+
+// plays station i of a list (copied, so L/R can step through it later)
+static void radio_play_from(const am_item *items, int n, int i)
+{
+    if (n <= 0 || i < 0 || i >= n) return;
+    if (items != radio_list) {
+        am_item *copy = malloc(sizeof *copy * n);
+        if (!copy) return;
+        memcpy(copy, items, sizeof *copy * n);
+        free(radio_list);
+        radio_list = copy;
+        radio_n = n;
+    }
+    radio_idx = i;
+    radio_cur = radio_list[i];
+    am_leave();
+    if (!radio_mode) {
+        audio_stop();
+        current = -1;
+        radio_mode = 1;
+        am_set_radio(1);
+    }
+    radio_fails = 0;
+    radio_tuned_at = now_t;
+    memset(&rad, 0, sizeof rad);
+    radio_connect();
+    marquee_t0 = now_t;
+}
+
+static void radio_toggle(void)
+{
+    if (radio_paused) { radio_connect(); show_msg("RADIO: BACK TO LIVE"); }
+    else { audio_stop(); radio_paused = 1; radio_retry_at = 0; }
 }
 
 static void skip(int dir)
 {
+    if (radio_mode) {
+        if (radio_n > 1) {
+            int i = (radio_idx + dir + radio_n) % radio_n;
+            radio_play_from(radio_list, radio_n, i);
+            show_toast("%s", radio_cur.name);
+        }
+        return;
+    }
     if (am_mode) {
         am_cmd(dir > 0 ? "next" : "previous");
         show_msg(dir > 0 ? "NEXT TRACK" : "PREVIOUS TRACK");
@@ -226,7 +307,12 @@ static void skip(int dir)
     if (current != before || audio_pos_ms() < 1000) { sel = current; marquee_t0 = now_t; }
 }
 
-static void toggle_pause(void) { if (am_mode) am_cmd("playpause"); else core_toggle_pause(); }
+static void toggle_pause(void)
+{
+    if (radio_mode) radio_toggle();
+    else if (am_mode) am_cmd("playpause");
+    else core_toggle_pause();
+}
 static void apply_audio_settings(void) { core_apply_audio(); }
 static int next_index(int dir) { return core_next_index(dir); }
 static void build_shuffle(void) { core_build_shuffle(); }
@@ -269,6 +355,11 @@ static void draw_main_window(void)
         pos = am_pos_ms();
         len = ams.dur_ms;
     }
+    if (radio_mode) {
+        as = radio_paused ? A_PAUSED : as;
+        pos = (int)((now_t - radio_tuned_at) * 1000);   // how long you've been listening
+        len = 0;
+    }
     st.state = as;
     if (len <= 0 && current >= 0) { pl_item it; if (pl_get(current, &it)) len = it.dur_ms; }
     if (len > 0 && pos > len) pos = len;
@@ -294,6 +385,17 @@ static void draw_main_window(void)
         kbps = cached_kbps;
     }
     if (am_mode) kbps = ams.kbps;
+    if (radio_mode) {
+        // the station's own bitrate (the number before the "k" in "MP3 128k"), not the bridge's re-encode
+        const char *kk = strrchr(radio_cur.album, 'k');
+        kbps = 0;
+        if (kk) {
+            const char *d = kk;
+            while (d > radio_cur.album && d[-1] >= '0' && d[-1] <= '9') d--;
+            if (d < kk) kbps = atoi(d);
+        }
+        if (kbps <= 0) kbps = 192;
+    }
     st.kbps = kbps;
     st.khz = (rate + 500) / 1000;
     st.channels = ch;
@@ -480,7 +582,7 @@ static void pill(int right_x, int cy, const char *val, int on)
 }
 
 // ---------------------------------------------------------------- options
-enum { OPT_SCREEN, OPT_APPLE, OPT_GAMEMUSIC, OPT_SHUFFLE, OPT_REPEAT, OPT_SLEEP, OPT_VOLUME, OPT_BALANCE, OPT_MINIVIS, OPT_TIME, OPT_SKIN, OPT_CLEAR, OPT_QUIT, OPT_N };
+enum { OPT_SCREEN, OPT_APPLE, OPT_RADIO, OPT_GAMEMUSIC, OPT_SHUFFLE, OPT_REPEAT, OPT_SLEEP, OPT_VOLUME, OPT_BALANCE, OPT_MINIVIS, OPT_TIME, OPT_SKIN, OPT_CLEAR, OPT_QUIT, OPT_N };
 static int opt_sel;
 static const int SLEEP_STEPS[] = { 0, 15, 30, 45, 60, 90, 120 };
 
@@ -492,6 +594,7 @@ static void opt_value(int i, char *out, int n, int *on)
     case OPT_SCREEN: snprintf(out, n, "%s", S.lock_lr ? "L/R locked" : "L/R skip"); *on = S.lock_lr; break;
     case OPT_GAMEMUSIC: snprintf(out, n, "%s", S.game_music ? "On" : "Off"); *on = S.game_music; break;
     case OPT_APPLE: if (am_mode) { snprintf(out, n, "Playing"); *on = 1; } break;
+    case OPT_RADIO: if (radio_mode) { snprintf(out, n, "%s", radio_paused ? "Paused" : "Playing"); *on = !radio_paused; } break;
     case OPT_SHUFFLE:
         if (am_mode) { snprintf(out, n, "%s", ams.shuffle ? "On" : "Off"); *on = ams.shuffle != 0; break; }
         snprintf(out, n, "%s", S.shuffle ? "On" : "Off"); *on = S.shuffle; break;
@@ -516,9 +619,9 @@ static void opt_value(int i, char *out, int n, int *on)
 
 static void draw_options(void)
 {
-    static const char *labels[OPT_N] = { "Turn screen off", "Apple Music", "Music in games", "Shuffle", "Repeat", "Sleep timer", "Volume", "Balance",
+    static const char *labels[OPT_N] = { "Turn screen off", "Apple Music", "Internet radio", "Music in games", "Shuffle", "Repeat", "Sleep timer", "Volume", "Balance",
                                          "Mini visualizer", "Time display", "Skin", "Clear playlist", "Quit MiniAmp" };
-    const int x = 110, y = 4, w = 420, h = 438, rh = 28;
+    const int x = 110, y = 4, w = 420, h = 438, rh = 26;
     card(x, y, w, h, "OPTIONS");
     for (int i = 0; i < OPT_N; i++) {
         int ry = y + 44 + i * (rh + 2);
@@ -529,6 +632,7 @@ static void draw_options(void)
         opt_value(i, v, sizeof v, &on);
         if (i == OPT_SCREEN && i == opt_sel) font_draw_mid(bb, f_small, x + 168, ry + rh / 2, "◀ ▶ change", C_DIM);
         if (i == OPT_APPLE && i == opt_sel && !am_mode) font_draw_mid(bb, f_small, x + 160, ry + rh / 2, "through Cider on your PC", C_DIM);
+        if (i == OPT_RADIO && i == opt_sel && !radio_mode) font_draw_mid(bb, f_small, x + 180, ry + rh / 2, "through Cider Bridge", C_DIM);
         if (i == OPT_GAMEMUSIC && i == opt_sel) font_draw_mid(bb, f_small, x + 160, ry + rh / 2, "keeps playing after Quit", C_DIM);
         if (v[0]) {
             char fv[64];
@@ -540,6 +644,7 @@ static void draw_options(void)
 
 static void open_skins(void);
 static void am_open(void);
+static void radio_open(void);
 
 static void option_change(int dir, int activate)
 {
@@ -564,6 +669,7 @@ static void option_change(int dir, int activate)
         settings_save();
         break;
     case OPT_APPLE: if (activate) am_open(); break;
+    case OPT_RADIO: if (activate) radio_open(); break;
     case OPT_SHUFFLE:
         if (am_mode) { am_cmd("shuffle"); ams.shuffle = !ams.shuffle; break; }
         S.shuffle = !S.shuffle; if (S.shuffle) build_shuffle(); break;
@@ -934,7 +1040,12 @@ static void draw_browser(void)
     }
     // now playing strip
     fill(0, 412, SCREEN_W, 32, C_PANEL);
-    if (am_mode && ams.has_track) {
+    if (radio_mode) {
+        char fitl[300];
+        font_fit(f_small, radio_cur.name, SCREEN_W - 120, fitl, sizeof fitl);
+        font_draw_mid(bb, f_small, 20, 428, radio_paused ? "❚❚" : "▶", acc);
+        font_draw_mid(bb, f_small, 40, 428, fitl, C_MUTED);
+    } else if (am_mode && ams.has_track) {
         char fitl[300];
         font_fit(f_small, ams.name, SCREEN_W - 120, fitl, sizeof fitl);
         font_draw_mid(bb, f_small, 20, 428, ams.playing ? "▶" : "❚❚", acc);
@@ -990,6 +1101,16 @@ static const am_entry AM_HOME_E[] = {
     { "Music on this SD card", "Back to your own files", ACT_SD, NULL, NULL, NULL, NULL },
 };
 static const am_menu AM_HOME = { "Apple Music", AM_HOME_E, (int)(sizeof AM_HOME_E / sizeof AM_HOME_E[0]) };
+static const am_entry RADIO_HOME_E[] = {
+    { "Favorites", "Stations you starred with Y", ACT_LIST, "/api/radio/favorites", NULL, NULL, NULL },
+    { "Picks", "KEXP, WXPN, WFUV and more", ACT_LIST, "/api/radio/picks", NULL, NULL, NULL },
+    { "Search", "Find a station by name", ACT_SEARCH, NULL, NULL, NULL, NULL },
+    { "Popular", "Most listened to on Radio Browser", ACT_LIST, "/api/radio/popular", NULL, NULL, NULL },
+    { "Genres", "Jazz, indie, classical, news...", ACT_LIST, "/api/radio/genres", NULL, NULL, NULL },
+    { "Music on this SD card", "Back to your own files", ACT_SD, NULL, NULL, NULL, NULL },
+};
+static const am_menu RADIO_HOME = { "Internet radio", RADIO_HOME_E, (int)(sizeof RADIO_HOME_E / sizeof RADIO_HOME_E[0]) };
+static int br_radio;              // the browser is showing radio (else Apple Music)
 
 #define AM_MAXDEPTH 4
 typedef struct { int kind; char title[160]; am_item parent; const am_menu *menu; int sel, scroll; } am_view;
@@ -1021,6 +1142,7 @@ static void am_restart_stream(void)
 static void am_begin(int wait_for_pc)
 {
     if (!am_mode) {
+        radio_leave();
         audio_stop();
         am_mode = 1;
         current = -1;
@@ -1044,6 +1166,7 @@ static void url_escape(char *out, int n, const char *s)
 }
 
 static int am_is_song(const am_item *it) { return strstr(it->type, "song") != NULL; }
+static int am_is_station(const am_item *it) { return !strcmp(it->type, "radio") || !strcmp(it->type, "radio-fav"); }
 static int am_is_section(const am_item *it) { return !strcmp(it->type, "_section"); }
 
 // where opening a container leads: fills path, returns the view kind (0 = it just plays)
@@ -1074,10 +1197,64 @@ static void am_play(const am_item *it)
     show_toast("Playing %s", it->name);
 }
 
+// the browser has one stack of views; switching between Apple Music and radio starts it over
+static void browser_root(int radio)
+{
+    if (br_radio == radio && amv[0].menu) return;
+    while (am_depth > 0) {
+        if (amv[am_depth].kind != AMV_MENU) am_list_clear(am_depth - 1);
+        am_depth--;
+    }
+    br_radio = radio;
+    amv[0].menu = radio ? &RADIO_HOME : &AM_HOME;
+    amv[0].sel = amv[0].scroll = 0;
+}
+
 static void am_open(void)
 {
+    browser_root(0);
     am_set_active(1);
     screen = SCR_AM;
+}
+
+static void radio_open(void)
+{
+    browser_root(1);
+    am_set_active(1);
+    screen = SCR_AM;
+}
+
+// plays the station under the cursor; the list's other stations become L/R
+static void radio_pick(int slot, int sel)
+{
+    int n = am_list_count(slot), k = 0, at = -1;
+    if (n <= 0) return;
+    am_item *items = malloc(sizeof *items * n);
+    if (!items) return;
+    for (int i = 0; i < n; i++) {
+        am_item it;
+        if (!am_list_get(slot, i, &it) || !am_is_station(&it)) continue;
+        if (i == sel) at = k;
+        items[k++] = it;
+    }
+    if (at >= 0) {
+        radio_play_from(items, k, at);
+        screen = panel = SCR_PLAYLIST;
+        show_toast("Tuning in to %s", radio_cur.name);
+    }
+    free(items);
+}
+
+static void radio_star(int slot, int sel)
+{
+    am_item it;
+    if (!am_list_get(slot, sel, &it) || !am_is_station(&it)) return;
+    int on = strcmp(it.type, "radio-fav") != 0;
+    am_radio_fav(it.id);
+    snprintf(it.type, sizeof it.type, "%s", on ? "radio-fav" : "radio");
+    am_list_set(slot, sel, &it);
+    if (radio_mode && !strcmp(radio_cur.id, it.id)) radio_cur = it;
+    show_toast(on ? "Added %s to favorites" : "Removed %s from favorites", it.name);
 }
 
 static void am_push(int kind, const char *title, const am_item *parent, const char *path, const am_menu *menu)
@@ -1157,6 +1334,7 @@ static void am_activate(int play_all)
         }
         case ACT_SD:
             am_leave();
+            radio_leave();
             audio_stop();
             open_browser();
             break;
@@ -1167,6 +1345,19 @@ static void am_activate(int play_all)
     if (play_all && v->kind == AMV_TRACKS) { am_play(&v->parent); return; }
     am_item it;
     if (!am_list_get(slot, v->sel, &it) || am_is_section(&it)) return;
+    if (am_is_station(&it)) {
+        if (play_all) radio_star(slot, v->sel);
+        else radio_pick(slot, v->sel);
+        return;
+    }
+    if (!strcmp(it.type, "radio-genre")) {
+        if (play_all) return;
+        char tag[120];
+        url_escape(tag, sizeof tag, it.id);
+        snprintf(path, sizeof path, "/api/radio/tag/%s", tag);
+        am_push(AMV_LIST, it.name, &it, path, NULL);
+        return;
+    }
     int kind = am_open_path(&it, path, sizeof path);
     if (play_all && kind == AMV_LIST) { show_toast("%s", "Open the artist to pick an album"); return; }
     if (!play_all && kind) { am_push(kind, it.name, &it, path, NULL); return; }
@@ -1178,6 +1369,16 @@ static void am_back(void)
     if (am_depth == 0) { screen = panel; return; }
     if (amv[am_depth].kind != AMV_MENU) am_list_clear(am_depth - 1);
     am_depth--;
+}
+
+static void radio_icon(int x, int cy, uint32_t c)
+{
+    // a little transistor radio: antenna, body, speaker
+    m2d_line(bb, x + 4, cy - 5, x + 12, cy - 9, 2, c, M2D_ALPHA);
+    rrect(x, cy - 5, 18, 12, 3, c);
+    m2d_circle(bb, x + 6, cy + 1, 3, C_BG, M2D_ALPHA, 1, 0);
+    fill(x + 11, cy - 2, 5, 2, C_BG);
+    fill(x + 11, cy + 2, 5, 2, C_BG);
 }
 
 static void search_icon(int x, int cy, uint32_t c)
@@ -1192,11 +1393,12 @@ static void draw_am_browser(void)
     m2d_clear(bb, C_BG, 0);
     fill(0, 0, SCREEN_W, 50, C_PANEL);
     fill(0, 50, SCREEN_W, 1, C_LINE);
-    font_draw_mid(bb, f_title, 20, 25, "APPLE MUSIC", accent());
+    font_draw_mid(bb, f_title, 20, 25, br_radio ? "INTERNET RADIO" : "APPLE MUSIC", accent());
     char right[200], fit[200];
     if (am_depth == 0) {
         if (ams.searching) snprintf(right, sizeof right, "looking for your PC...");
         else if (!ams.found) snprintf(right, sizeof right, "PC not found");
+        else if (br_radio) snprintf(right, sizeof right, "via Cider Bridge on %s", ams.host);
         else if (!ams.cider) snprintf(right, sizeof right, "Cider isn't open");
         else snprintf(right, sizeof right, "via Cider on %s", ams.host);
     } else snprintf(right, sizeof right, "%s", v->title);
@@ -1255,6 +1457,26 @@ static void draw_am_browser(void)
             continue;
         }
         if (i == v->sel) rrect(10, y, SCREEN_W - 20, B_ROWH - 2, 8, C_SEL);
+        if (am_is_station(&it)) {
+            int fav = !strcmp(it.type, "radio-fav");
+            int playing = radio_mode && !strcmp(radio_cur.id, it.id);
+            radio_icon(24, cy, playing ? C_GREEN : acc);
+            char fmtv[48] = "";
+            snprintf(fmtv, sizeof fmtv, "%s", it.album);
+            int rw = fmtv[0] ? font_width(f_key, fmtv) + 16 : 0;
+            int starw = fav ? font_width(f_mid, "★") + 10 : 0;
+            int avail = SCREEN_W - 54 - 26 - rw - starw;
+            font_fit(f_mid, it.name, it.artist[0] ? avail * 55 / 100 : avail, nm, sizeof nm);
+            font_draw_mid(bb, f_mid, 54, cy, nm, playing ? C_GREEN : C_TEXT);
+            int x = 54 + font_width(f_mid, nm) + 10;
+            if (fav) { font_draw_mid(bb, f_mid, x, cy, "★", C_GOLD); x += starw; }
+            if (it.artist[0]) {
+                font_fit(f_small, it.artist, SCREEN_W - 26 - rw - x, sub, sizeof sub);
+                font_draw_mid(bb, f_small, x + 2, cy + 1, sub, C_DIM);
+            }
+            if (fmtv[0]) font_draw_mid(bb, f_key, SCREEN_W - 26 - font_width(f_key, fmtv), cy, fmtv, C_DIM);
+            continue;
+        }
         int song = am_is_song(&it);
         int artist = !strcmp(it.type, "artists");
         if (song) font_draw_mid(bb, f_mid, 26, cy, "♪", C_DIM);
@@ -1285,7 +1507,14 @@ static void draw_am_browser(void)
     }
     // now playing strip
     fill(0, 412, SCREEN_W, 32, C_PANEL);
-    if (am_mode && ams.has_track) {
+    if (radio_mode) {
+        char line[500], fitl[500];
+        if (rad.title[0]) snprintf(line, sizeof line, "%s: %s", radio_cur.name, rad.title);
+        else snprintf(line, sizeof line, "%s", radio_cur.name);
+        font_fit(f_small, line, SCREEN_W - 80, fitl, sizeof fitl);
+        font_draw_mid(bb, f_small, 20, 428, radio_paused ? "❚❚" : "▶", acc);
+        font_draw_mid(bb, f_small, 40, 428, fitl, C_MUTED);
+    } else if (am_mode && ams.has_track) {
         char line[400], fitl[400], t[16];
         if (ams.artist[0]) snprintf(line, sizeof line, "%s - %s", ams.artist, ams.name);
         else snprintf(line, sizeof line, "%s", ams.name);
@@ -1301,6 +1530,71 @@ static void draw_am_browser(void)
 }
 
 // the panel under the main window while Apple Music plays
+static void draw_radio_panel(void)
+{
+    panel_frame("INTERNET RADIO", ams.found ? ams.host : NULL);
+    int ax = PX + 14, ay = PY + 32, as = 148;
+    if (am_art) m2d_blit(am_art, 0, 0, am_art->w, am_art->h, bb, ax, ay, as, as, 0xffffffffu, M2D_REPLACE, 0);
+    else {
+        fill(ax, ay, as, as, mix(sk->pl_bg, 0xffffffffu, 0.06f));
+        int cy = ay + as / 2;
+        uint32_t c = mix(sk->pl_normal, sk->pl_bg, 0.5f);
+        rrect(ax + 34, cy - 22, 80, 50, 8, c);
+        m2d_line(bb, ax + 52, cy - 22, ax + 90, cy - 46, 3, c, M2D_ALPHA);
+        m2d_circle(bb, ax + 60, cy + 3, 13, mix(sk->pl_bg, 0xffffffffu, 0.06f), M2D_ALPHA, 1, 0);
+    }
+    int tx = ax + as + 18, tw = PX + PW - 16 - tx;
+    char b[400];
+    uint32_t dim = mix(sk->pl_normal, sk->pl_bg, 0.35f);
+    font_fit(f_title, radio_cur.name, tw - (strcmp(radio_cur.type, "radio-fav") ? 0 : 26), b, sizeof b);
+    font_draw_mid(bb, f_title, tx, ay + 18, b, sk->pl_current);
+    if (!strcmp(radio_cur.type, "radio-fav")) font_draw_mid(bb, f_mid, tx + font_width(f_title, b) + 8, ay + 18, "★", C_GOLD);
+    // the song, when the station says what it is
+    int live = !radio_paused && radio_retry_at == 0 && audio_state() == A_PLAYING && now_t - radio_started > 3.0;
+    const char *song = rad.title[0] ? rad.title : live && rad.active && !rad.titles ? "This station doesn't send song titles" : "";
+    if (rad.title[0]) {
+        // "Artist - Title" -> two lines
+        char artist[240] = "", title[240];
+        const char *dash = strstr(rad.title, " - ");
+        if (dash) {
+            snprintf(artist, sizeof artist, "%.*s", (int)(dash - rad.title), rad.title);
+            snprintf(title, sizeof title, "%s", dash + 3);
+        } else snprintf(title, sizeof title, "%s", rad.title);
+        font_fit(f_mid, title, tw, b, sizeof b);
+        font_draw_mid(bb, f_mid, tx, ay + 48, b, sk->pl_normal);
+        if (artist[0]) {
+            font_fit(f_small, artist, tw, b, sizeof b);
+            font_draw_mid(bb, f_small, tx, ay + 70, b, sk->pl_normal);
+        }
+    } else if (song[0]) {
+        font_fit(f_small, song, tw, b, sizeof b);
+        font_draw_mid(bb, f_small, tx, ay + 48, b, dim);
+    }
+    font_fit(f_small, radio_cur.artist, tw, b, sizeof b);
+    font_draw_mid(bb, f_small, tx, ay + 96, b, dim);
+    // status line
+    int by = ay + as - 12;
+    const char *state;
+    char sbuf[200];
+    int as_ = audio_state();
+    if (radio_paused && radio_fails >= 2) {
+        snprintf(sbuf, sizeof sbuf, "%s", rad.error[0] ? rad.error : "Couldn't tune in");
+        state = sbuf;
+    } else if (radio_paused) state = "PAUSED · A rejoins live";
+    else if (radio_retry_at > 0) state = "Reconnecting...";
+    else if (as_ != A_PLAYING || now_t - radio_started < 1.0) state = "Tuning in...";
+    else {
+        snprintf(sbuf, sizeof sbuf, "LIVE%s%s", radio_cur.album[0] ? " · " : "", radio_cur.album);
+        state = sbuf;
+    }
+    font_fit(f_small, state, tw, b, sizeof b);
+    font_draw_mid(bb, f_small, tx, by, b, radio_paused || radio_retry_at > 0 ? accent() : dim);
+    if (radio_n > 1) {
+        snprintf(sbuf, sizeof sbuf, "%d / %d", radio_idx + 1, radio_n);
+        font_draw_mid(bb, f_small, tx + tw - font_width(f_small, sbuf), by, sbuf, dim);
+    }
+}
+
 static void draw_am_panel(void)
 {
     panel_frame("APPLE MUSIC", ams.found ? ams.host : NULL);
@@ -1352,7 +1646,7 @@ static void draw_am_panel(void)
 static void am_update(void)
 {
     static int was_active = -1;
-    int act = am_mode || screen == SCR_AM || screen == SCR_KB;
+    int act = am_mode || radio_mode || screen == SCR_AM || screen == SCR_KB;
     if (act != was_active) { am_set_active(act); was_active = act; }
     if (!act) return;
     am_get_status(&ams);
@@ -1365,6 +1659,11 @@ static void am_update(void)
             if (am_art) m2d_surface_upload_rgba(am_art, px, w, h);
         }
         free(px);
+    }
+    if (radio_mode) {
+        am_get_radio(&rad);
+        if (radio_retry_at > 0 && now_t >= radio_retry_at) radio_connect();
+        return;
     }
     if (!am_mode) return;
     if (am_seek_due > 0 && now_t >= am_seek_due) {
@@ -1413,7 +1712,7 @@ static void kb_submit(void)
     if (!n) { show_toast("%s", "Type something to search for"); return; }
     char q[200], path[300], title[120];
     url_escape(q, sizeof q, t);
-    snprintf(path, sizeof path, "/api/search?q=%s", q);
+    snprintf(path, sizeof path, br_radio ? "/api/radio/search?q=%s" : "/api/search?q=%s", q);
     snprintf(title, sizeof title, "Search: %s", t);
     screen = SCR_AM;
     am_push(AMV_LIST, title, NULL, path, NULL);
@@ -1448,14 +1747,15 @@ static void draw_kb(void)
 {
     const int x = 60, y = 64, w = 520, h = 330;
     card(x, y, w, h, "SEARCH");
-    font_draw_mid(bb, f_small, x + w - 24 - font_width(f_small, "Apple Music catalog"), y + 26, "Apple Music catalog", C_DIM);
+    const char *scope = br_radio ? "Radio stations" : "Apple Music catalog";
+    font_draw_mid(bb, f_small, x + w - 24 - font_width(f_small, scope), y + 26, scope, C_DIM);
     // text field
     int fx = x + 24, fy = y + 52, fw = w - 48, fh = 40;
     rrect(fx, fy, fw, fh, 8, 0xff0b0d11u);
     char shown[80];
     font_fit_left(f_mid, kb_text, fw - 30, shown, sizeof shown);
     font_draw_mid(bb, f_mid, fx + 14, fy + fh / 2, kb_text[0] ? shown : "", C_TEXT);
-    if (!kb_text[0]) font_draw_mid(bb, f_mid, fx + 14, fy + fh / 2, "Song, album, artist...", C_DIM);
+    if (!kb_text[0]) font_draw_mid(bb, f_mid, fx + 14, fy + fh / 2, br_radio ? "Station name or call letters..." : "Song, album, artist...", C_DIM);
     if (fmod(now_t, 1.0) < 0.6) fill(fx + 14 + (kb_text[0] ? font_width(f_mid, shown) : 0) + 2, fy + 10, 2, fh - 20, accent());
     // keys
     const int kw = 46, kh = 38, gap = 4, kx = x + (w - (10 * kw + 9 * gap)) / 2, ky = fy + fh + 18;
@@ -1505,11 +1805,12 @@ static void draw_vis(void)
         uint32_t al = (uint32_t)(a * 255);
         pl_item it;
         char line[260] = "", sub[120];
-        if (am_mode) font_fit(f_mid, ams.name, 520, line, sizeof line);
+        if (radio_mode) font_fit(f_mid, rad.title[0] ? rad.title : radio_cur.name, 520, line, sizeof line);
+        else if (am_mode) font_fit(f_mid, ams.name, 520, line, sizeof line);
         else if (current >= 0 && pl_get(current, &it)) font_fit(f_mid, it.name, 520, line, sizeof line);
         char t[16], l[16];
-        fmt_time(t, sizeof t, am_mode ? am_pos_ms() : audio_pos_ms());
-        fmt_time(l, sizeof l, am_mode ? ams.dur_ms : audio_len_ms());
+        fmt_time(t, sizeof t, radio_mode ? (int)((now_t - radio_tuned_at) * 1000) : am_mode ? am_pos_ms() : audio_pos_ms());
+        fmt_time(l, sizeof l, radio_mode ? 0 : am_mode ? ams.dur_ms : audio_len_ms());
         snprintf(sub, sizeof sub, "%s / %s   ·   %s", t, l, vis_preset_name(S.vis_preset));
         int w = font_width(f_mid, line);
         int sw = font_width(f_small, sub);
@@ -1623,6 +1924,13 @@ static void on_key(int k, int repeat)
     if (k == K_START && !repeat) { int st = audio_state(); press_flash(st == A_PLAYING ? PB_PAUSE : PB_PLAY); toggle_pause(); return; }
     if ((k == K_SELECT || k == K_MENU) && !repeat) { opt_sel = 0; screen = SCR_OPTIONS; return; }
     if (k == K_X && screen == SCR_PLAYLIST && !repeat) { screen = SCR_VIS; vis_info_until = now_t + 3; return; }
+    if (screen == SCR_PLAYLIST && radio_mode) {
+        if (repeat) return;
+        if (k == K_A) { press_flash(radio_paused ? PB_PLAY : PB_PAUSE); toggle_pause(); }
+        else if (k == K_B) { press_flash(PB_EJECT); radio_open(); }
+        else if (k == K_Y) { press_flash(PB_EQ); screen = panel = SCR_EQ; }
+        return;
+    }
     if (screen == SCR_PLAYLIST && am_mode) {
         if (k == K_LEFT || k == K_RIGHT) {
             if (!repeat) held_since = now_t;
@@ -1698,8 +2006,19 @@ static void draw_frame(void)
             else if (can_play) hint_bar(sub, 3);
             else { hint h2[] = { { "A", "Open" }, { "B", "Back" } }; hint_bar(h2, 2); }
         } else {
-            hint h[] = { { "A", "Open / Play" }, { "Y", "Play all" }, { "B", "Back" } };
-            hint_bar(h, 3);
+            am_item cur;
+            int station = am_list_get(am_depth - 1, amv[am_depth].sel, &cur) && am_is_station(&cur);
+            int genre = !station && am_list_get(am_depth - 1, amv[am_depth].sel, &cur) && !strcmp(cur.type, "radio-genre");
+            if (station) {
+                hint h[] = { { "A", "Play" }, { "Y", strcmp(cur.type, "radio-fav") ? "Favorite" : "Unfavorite" }, { "B", "Back" } };
+                hint_bar(h, 3);
+            } else if (genre) {
+                hint h[] = { { "A", "Open" }, { "B", "Back" } };
+                hint_bar(h, 2);
+            } else {
+                hint h[] = { { "A", "Open / Play" }, { "Y", "Play all" }, { "B", "Back" } };
+                hint_bar(h, 3);
+            }
         }
     } else if (screen == SCR_BROWSER) {
         draw_browser();
@@ -1724,6 +2043,12 @@ static void draw_frame(void)
             draw_eq_panel();
             hint h[] = { { "↑/↓", "Level" }, { "←/→", "Band" }, { "A", "On/Off" }, { "X", "Presets" }, { "B", "Back" } };
             hint_bar(h, 5);
+        } else if (radio_mode) {
+            draw_radio_panel();
+            const char *a = radio_paused ? "Play" : "Pause";
+            hint more[] = { { "A", a }, { "B", "Stations" }, { "L/R", "Station" }, { "X", "Visuals" }, { "SELECT", "Menu" } };
+            hint one[] = { { "A", a }, { "B", "Stations" }, { "X", "Visuals" }, { "SELECT", "Menu" } };
+            if (radio_n > 1) hint_bar(more, 5); else hint_bar(one, 4);
         } else if (am_mode) {
             draw_am_panel();
             hint h[] = { { "A", "Pause" }, { "B", "Browse" }, { "Y", "EQ" }, { "X", "Visuals" }, { "SELECT", "Menu" } };
@@ -1756,7 +2081,7 @@ static void on_signal(int s) { (void)s; quit = 1; }
 
 static void save_all(void)
 {
-    if (!am_mode) {   // keep the SD card resume point while Apple Music plays
+    if (!am_mode && !radio_mode) {   // keep the SD card resume point while streaming
         S.cur_index = current;
         S.cur_pos_ms = current >= 0 ? audio_pos_ms() : 0;
     }
@@ -1879,7 +2204,25 @@ int main(int argc, char **argv)
             next_repeat = now_t + ((held_key == K_LEFT || held_key == K_RIGHT) && screen == SCR_PLAYLIST ? 0.16 : 0.07);
         }
         am_update();
-        if (am_mode) {
+        if (radio_mode) {
+            int fin = audio_take_finished(), err = audio_take_error();
+            if ((fin || err) && !radio_paused && radio_retry_at == 0) {
+                // a station that fails right away twice is reported, not retried forever;
+                // one that drops after playing a while is reconnected
+                if (now_t - radio_started < 8.0) radio_fails++;
+                else radio_fails = 0;
+                if (radio_fails >= 2) {
+                    audio_stop();
+                    radio_paused = 1;
+                    am_get_radio(&rad);
+                    show_toast("Couldn't tune in to %s", radio_cur.name);
+                } else {
+                    radio_retry_at = now_t + 2;
+                    if (now_t - radio_started >= 8.0) show_toast("%s", "Reconnecting to the station...");
+                }
+            }
+        }
+        else if (am_mode) {
             // the stream dropped (PC asleep, Wi-Fi hiccup): reconnect in a moment
             int fin = audio_take_finished(), err = audio_take_error();
             if ((fin || err) && now_t - am_started_at > 1.0 && am_retry_at == 0) {
@@ -1904,7 +2247,9 @@ int main(int argc, char **argv)
         }
         if (sleep_at > 0 && now_t >= sleep_at) {
             sleep_at = 0; sleep_min = 0;
-            if (am_mode) am_cmd("pause"); else audio_set_paused(1);
+            if (radio_mode) { if (!radio_paused) radio_toggle(); }
+            else if (am_mode) am_cmd("pause");
+            else audio_set_paused(1);
             show_toast("%s", "Sleep timer: paused");
         }
         if (now_t - last_save > 15) { save_all(); last_save = now_t; }

@@ -56,6 +56,9 @@ def load_config():
 
 CFG = load_config()
 
+sys.path.insert(0, HERE)
+import radio  # noqa: E402  (internet radio; lives next to this file)
+
 
 def log(*args):
     print(time.strftime("%H:%M:%S"), *args, flush=True)
@@ -421,7 +424,7 @@ def to_text(obj):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "CiderBridge/0.3"
+    server_version = "CiderBridge/0.4"
     text_mode = False
 
     def log_message(self, fmt, *args):
@@ -467,6 +470,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if p in ("/", "/index.html"):
                 return self.serve_file("test_page.html", "text/html; charset=utf-8")
+            if p == "/radio.mp3":
+                return self.radio_stream(q.get("uuid", [""])[0])
+            if p.startswith("/api/radio/"):
+                return self.radio_get(p[len("/api/radio/"):], q)
             if p in ("/stream.mp3", "/stream"):
                 return self.stream()
             if p == "/api/status":
@@ -519,6 +526,11 @@ class Handler(BaseHTTPRequestHandler):
         body = self.body_json()
         try:
             name = p[len("/api/"):] if p.startswith("/api/") else ""
+            if name == "radio/favorite":
+                uuid = str(body.get("uuid", ""))
+                if not uuid:
+                    return self.send_json({"error": "need uuid"}, 400)
+                return self.send_json({"favorite": 1 if RADIO.toggle_fav(uuid) else 0})
             if name in SIMPLE_COMMANDS:
                 cider.post(SIMPLE_COMMANDS[name])
                 gen = bump() if name in FLUSH_ON else STATE["generation"]
@@ -599,6 +611,72 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    # ---- internet radio
+    def radio_get(self, rest, q):
+        off = int(q.get("offset", ["0"])[0])
+        parts = rest.strip("/").split("/", 1)
+        kind = parts[0]
+        if kind == "status":
+            return self.send_json(RADIO.status())
+        if kind == "logo" and len(parts) == 2:
+            data = RADIO.logo(urllib.parse.unquote(parts[1]))
+            if not data:
+                return self.send_json({"error": "no logo"}, 404)
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "max-age=86400")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        if kind == "picks":
+            return self.send_json(RADIO.items(RADIO.get_picks()))
+        if kind == "favorites":
+            return self.send_json(RADIO.items(RADIO.favs))
+        if kind == "popular":
+            return self.send_json(RADIO.items(RADIO.popular(off), off))
+        if kind == "genres":
+            return self.send_json({"items": [{"id": g, "type": "radio-genre", "name": g[:1].upper() + g[1:]}
+                                             for g in radio.GENRES]})
+        if kind == "tag" and len(parts) == 2:
+            return self.send_json(RADIO.items(RADIO.by_tag(urllib.parse.unquote(parts[1]), off), off))
+        if kind == "search":
+            term = q.get("q", [""])[0].strip()
+            if not term:
+                return self.send_json({"error": "missing q"}, 400)
+            return self.send_json(RADIO.items(RADIO.search(term, off), off))
+        return self.send_json({"error": "not found"}, 404)
+
+    def radio_stream(self, uuid):
+        if not uuid:
+            return self.send_json({"error": "need uuid"}, 400)
+        try:
+            sess = RADIO.open_stream(uuid)
+        except Exception as e:
+            log("radio:", e)
+            return self.send_json({"error": str(e)}, 502)
+        gen = sess.chunks()
+        first = next(gen, None)   # wait for the station before answering, so a dead one can be reported
+        if first is None:
+            log(f"radio: {sess.st.get('name')!r} failed: {sess.error}")
+            sess.stop()
+            return self.send_json({"error": sess.error or "The station didn't answer"}, 502)
+        log(f"radio listener {self.client_address[0]} on {sess.st.get('name')!r}")
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/mpeg")
+            self.send_header("Cache-Control", "no-cache, no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(first)
+            for chunk in gen:
+                self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            sess.stop()
+            log("radio listener left")
+
     def stream(self):
         q = broadcaster.add()
         log(f"listener connected from {self.client_address[0]} ({broadcaster.count()} total)")
@@ -647,6 +725,8 @@ def discovery_loop(port):
 def main():
     no_audio = "--no-audio" in sys.argv  # API-only mode, for testing without PipeWire
     threading.Thread(target=discovery_loop, args=(CFG["listen_port"],), daemon=True).start()
+    global RADIO
+    RADIO = radio.Radio(CFG, HERE)
     audio = None
     if "--test-tone" in sys.argv:
         # developer mode: stream a generated tone instead of Cider (no PipeWire needed)

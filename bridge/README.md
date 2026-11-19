@@ -73,6 +73,34 @@ Each list item looks like this:
 
 **Flushing on skip.** MiniAmp keeps a short audio buffer, so after a skip it would otherwise play a second or two of the old track. Every command that changes the track returns a new `generation`, which also shows up in `/api/status`. When MiniAmp sees it change, it drops its buffer and reconnects to `/stream.mp3`. That reconnect lands on the live point, so the new track starts right away.
 
+## Internet radio
+
+`radio.py` adds internet radio for MiniAmp. Stations come from
+[Radio Browser](https://www.radio-browser.info), a free, community-run directory (no key).
+Whatever a station sends (MP3 or AAC, http or https, Icecast/Shoutcast or HLS), ffmpeg
+turns it into the same MP3 stream MiniAmp plays for Apple Music. For Icecast/Shoutcast
+stations the bridge also reads the song titles they send (ICY metadata). Favorites are
+saved next to the bridge in `radio_favorites.json`. Plays are reported to Radio Browser,
+as it asks apps to do, so its popularity lists stay useful.
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/api/radio/picks` | A short built-in list (KEXP, WXPN, WFUV...), looked up by name. |
+| GET | `/api/radio/popular?offset=0` | Most listened-to stations. |
+| GET | `/api/radio/search?q=...&offset=0` | Stations by name. |
+| GET | `/api/radio/genres` | Genre list (`radio-genre` items). |
+| GET | `/api/radio/tag/<tag>?offset=0` | Stations in a genre. |
+| GET | `/api/radio/favorites` | Starred stations. |
+| POST | `/api/radio/favorite` | `{"uuid": ...}` toggles a favorite; answers `favorite=0/1`. |
+| GET | `/radio.mp3?uuid=...` | The station as MP3. Answers 502 with an error if the station is down. |
+| GET | `/api/radio/status` | `name`, `title` (song), `where`, `format`, `error`, `titles`, `artwork` |
+| GET | `/api/radio/logo/<uuid>` | Station logo as a 160x160 JPEG. |
+
+Stations are list items with `type` `radio` (or `radio-fav` when starred), `artist` = where
+and genre, `album` = format, e.g. `AAC 160k`.
+`RADIO_BROWSER_HOST=http://host:port` points the bridge at another Radio Browser server
+(used for testing).
+
 ## Testing without Cider
 
 `python3 cider_bridge.py --test-tone` streams a 440 Hz tone instead of Cider's audio, and

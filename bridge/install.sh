@@ -29,7 +29,7 @@ fi
 
 echo "==> Copying files to $DEST"
 mkdir -p "$DEST"
-cp cider_bridge.py test_page.html "$DEST/"
+cp cider_bridge.py radio.py test_page.html "$DEST/"
 if [ ! -f "$DEST/config.json" ]; then
   cp config.example.json "$DEST/config.json"
   echo "   Created $DEST/config.json"

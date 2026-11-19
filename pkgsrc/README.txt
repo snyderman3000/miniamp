@@ -72,6 +72,20 @@ B browses. Picking music on the SD card switches back and pauses Cider.
 The handheld's address book for the PC is MiniAmp/data/cider_bridge.txt
 (host:port); delete it to make MiniAmp search again.
 
+Internet radio: Options > Internet radio. Stations come from Radio Browser
+(radio-browser.info), a free directory of about 50,000 stations, and play
+through Cider Bridge on your PC, which turns any station into a stream the
+handheld can play (so the PC has to be on, as for Apple Music).
+  Favorites   stations you starred
+  Picks       KEXP, WXPN (home of World Cafe), WFUV, KCRW Eclectic 24 and more
+  Search      by station name or call letters (X from the radio home screen)
+  Popular     the most listened-to stations
+  Genres      jazz, indie, classical, news...
+In a list: A plays, Y stars or unstars a station. While a station plays:
+A pauses (pressing it again rejoins the live broadcast), L / R step through
+the list you picked the station from, B goes back to the stations. Song
+titles show when the station sends them. Favorites are kept on the PC.
+
 Skins: copy classic .wsz skin files into MiniAmp/skins, then pick one in
 Options > Skin. Thousands are at https://skins.webamp.org.
 

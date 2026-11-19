@@ -30,6 +30,19 @@ typedef struct {
     int port;
 } am_status;
 
+// Internet radio, also through the bridge (it fetches the station and turns
+// it into MP3). While radio is on, the bridge's radio status is polled
+// instead of Cider's, and the artwork is the station's logo.
+typedef struct {
+    int active;             // the bridge is playing a station for us
+    char name[160], title[240], where[160], format[48], error[160];
+    int titles;             // the station sends song titles
+} am_radio;
+void am_set_radio(int on);
+void am_get_radio(am_radio *out);
+int am_radio_url(const char *uuid, char *out, int n);
+void am_radio_fav(const char *uuid);   // toggles a favorite (kept on the PC)
+
 void am_init(const char *data_dir);
 void am_quit(void);
 double am_now(void);
@@ -55,6 +68,7 @@ void am_list_more(int slot);                          // next page, if any
 void am_list_clear(int slot);
 int am_list_count(int slot);
 int am_list_get(int slot, int i, am_item *out);
+void am_list_set(int slot, int i, const am_item *it);   // e.g. a station just starred
 // returns 1 while loading; *more = another page exists; err gets a message on failure
 int am_list_state(int slot, int *more, char *err, int errn);
 

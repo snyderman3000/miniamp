@@ -3,3 +3,6 @@ pkg/
 dist/
 __pycache__/
 lib/libpadsp_wrap.so
+bridge/radio_favorites.json
+bridge/config.json
+bridge/__pycache__/
