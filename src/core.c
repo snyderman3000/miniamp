@@ -7,7 +7,7 @@
 #include "audio.h"
 #include "playlist.h"
 
-settings S = { .volume = 80, .vis_mode = 1, .cur_index = -1 };
+settings S = { .volume = 80, .vis_mode = 1, .cur_index = -1, .lock_lr = 1 };
 char app_dir[512], data_dir[512], root_dir[512];
 int current = -1;
 static int *shuffle_order, shuffle_n;
@@ -50,6 +50,7 @@ void settings_load(void)
         else if (!strcmp(k, "cur_pos_ms")) S.cur_pos_ms = atoi(v);
         else if (!strcmp(k, "game_music")) S.game_music = atoi(v);
         else if (!strcmp(k, "resume_playing")) S.resume_playing = atoi(v);
+        else if (!strcmp(k, "lock_lr")) S.lock_lr = atoi(v);
     }
     fclose(f);
 }
@@ -63,8 +64,8 @@ void settings_save(void)
     if (!f) return;
     fprintf(f, "volume=%d\nbalance=%d\neq_on=%d\neq_pre=%.1f\neq=", S.volume, S.balance, S.eq_on, S.eq_pre);
     for (int i = 0; i < EQ_BANDS; i++) fprintf(f, "%s%.1f", i ? "," : "", S.eq[i]);
-    fprintf(f, "\neq_preset=%s\nshuffle=%d\nrepeat=%d\nvis_mode=%d\nvis_preset=%d\nremaining=%d\nskin=%s\nlast_dir=%s\ncur_index=%d\ncur_pos_ms=%d\ngame_music=%d\nresume_playing=%d\n",
-            S.eq_preset, S.shuffle, S.repeat, S.vis_mode, S.vis_preset, S.remaining, S.skin, S.last_dir, S.cur_index, S.cur_pos_ms, S.game_music, S.resume_playing);
+    fprintf(f, "\neq_preset=%s\nshuffle=%d\nrepeat=%d\nvis_mode=%d\nvis_preset=%d\nremaining=%d\nskin=%s\nlast_dir=%s\ncur_index=%d\ncur_pos_ms=%d\ngame_music=%d\nresume_playing=%d\nlock_lr=%d\n",
+            S.eq_preset, S.shuffle, S.repeat, S.vis_mode, S.vis_preset, S.remaining, S.skin, S.last_dir, S.cur_index, S.cur_pos_ms, S.game_music, S.resume_playing, S.lock_lr);
     fclose(f);
     rename(tmp, p);
 }

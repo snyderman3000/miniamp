@@ -15,6 +15,7 @@ typedef struct {
     int cur_index, cur_pos_ms;
     int game_music;               // keep playing in games after quitting
     int resume_playing;           // the background service was playing when it stopped
+    int lock_lr;                  // screen off: ignore the shoulder buttons (no accidental skips)
 } settings;
 
 extern settings S;

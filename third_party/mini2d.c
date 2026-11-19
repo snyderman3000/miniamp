@@ -643,6 +643,10 @@ int m2d_init(int w, int h)
 int m2d_fb_width(void) { return fb_w; }
 int m2d_fb_height(void) { return fb_h; }
 int m2d_frame_count(void) { return frame_no; }
+#ifdef M2D_HOST
+// test runs: keeps scripted input moving while nothing is drawn (screen off)
+void m2d_skip_frame(void) { frame_no++; }
+#endif
 
 // Hands the finished frame to the display and switches drawing to the other buffer.
 // Blocks only while the previous frame is still waiting for its vblank.

@@ -489,6 +489,7 @@ static void opt_value(int i, char *out, int n, int *on)
     *on = 0;
     out[0] = 0;
     switch (i) {
+    case OPT_SCREEN: snprintf(out, n, "%s", S.lock_lr ? "L/R locked" : "L/R skip"); *on = S.lock_lr; break;
     case OPT_GAMEMUSIC: snprintf(out, n, "%s", S.game_music ? "On" : "Off"); *on = S.game_music; break;
     case OPT_APPLE: if (am_mode) { snprintf(out, n, "Playing"); *on = 1; } break;
     case OPT_SHUFFLE:
@@ -526,7 +527,7 @@ static void draw_options(void)
         char v[64];
         int on;
         opt_value(i, v, sizeof v, &on);
-        if (i == OPT_SCREEN && i == opt_sel) font_draw_mid(bb, f_small, x + w - 26 - font_width(f_small, "START pauses · L/R skip"), ry + rh / 2, "START pauses · L/R skip", C_DIM);
+        if (i == OPT_SCREEN && i == opt_sel) font_draw_mid(bb, f_small, x + 168, ry + rh / 2, "◀ ▶ change", C_DIM);
         if (i == OPT_APPLE && i == opt_sel && !am_mode) font_draw_mid(bb, f_small, x + 160, ry + rh / 2, "through Cider on your PC", C_DIM);
         if (i == OPT_GAMEMUSIC && i == opt_sel) font_draw_mid(bb, f_small, x + 160, ry + rh / 2, "keeps playing after Quit", C_DIM);
         if (v[0]) {
@@ -543,7 +544,14 @@ static void am_open(void);
 static void option_change(int dir, int activate)
 {
     switch (opt_sel) {
-    case OPT_SCREEN: if (activate) { screen = panel; set_screen_off(1); } break;
+    case OPT_SCREEN:
+        if (activate) { screen = panel; set_screen_off(1); }
+        else {
+            S.lock_lr = !S.lock_lr;
+            settings_save();
+            show_toast("%s", S.lock_lr ? "Screen off: L/R ignored, START pauses" : "Screen off: L/R skip, START pauses");
+        }
+        break;
     case OPT_GAMEMUSIC:
         if (!S.game_music) {
             if (gm_install()) { S.game_music = 1; show_toast("%s", "On: quit while playing and the music keeps going"); }
@@ -1851,6 +1859,9 @@ int main(int argc, char **argv)
             if (code == K_POWER) continue;
             if (screen_off) {
                 if (val != 1) continue;
+                // locked: the shoulder buttons do nothing (they're easy to press when the
+                // handheld is set down) and don't wake the screen either
+                if (S.lock_lr && (code == K_L || code == K_R || code == K_L2 || code == K_R2)) continue;
                 if (code == K_START) toggle_pause();
                 else if (code == K_L) skip(-1);
                 else if (code == K_R) skip(1);
@@ -1899,7 +1910,13 @@ int main(int argc, char **argv)
         if (now_t - last_save > 15) { save_all(); last_save = now_t; }
         if (screen == SCR_SKINS) skins_update();
 
-        if (screen_off) { usleep(40000); continue; }
+        if (screen_off) {
+#ifdef M2D_HOST
+            m2d_skip_frame();
+#endif
+            usleep(40000);
+            continue;
+        }
         vis_analyze(&vd, dt, audio_state() == A_PLAYING);
         draw_frame();
         double drawn = now();

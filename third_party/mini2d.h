@@ -35,6 +35,9 @@ int m2d_init(int w, int h);
 void m2d_present(void);
 int m2d_poll_key(int *code, int *value);
 int m2d_frame_count(void);
+#ifdef M2D_HOST
+void m2d_skip_frame(void);
+#endif
 void m2d_quit(void);
 
 #endif

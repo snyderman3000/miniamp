@@ -25,9 +25,11 @@ Controls
   SELECT / MENU  options: screen off, shuffle, repeat, sleep timer, volume,
                  skins, quit
 
-Screen off: Options > Turn screen off. Music keeps playing; START pauses,
-L / R skip, any other button turns the screen back on. (The power button
-puts the whole handheld to sleep, which stops the music.)
+Screen off: Options > Turn screen off. Music keeps playing; START pauses
+and any other button turns the screen back on. The shoulder buttons are
+locked while the screen is off, so setting the handheld down doesn't skip
+songs; to have L / R skip instead, press Left/Right on "Turn screen off".
+(The power button puts the whole handheld to sleep, which stops the music.)
 
 Music in games: Options > Music in games. With it on, quit MiniAmp while a
 song is playing and the music keeps going in the menu, in games and in other
