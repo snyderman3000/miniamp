@@ -2297,8 +2297,26 @@ int main(int argc, char **argv)
     }
     if (screen_off) set_screen_off(0);
     int handoff = S.game_music && current >= 0 && audio_state() == A_PLAYING;
+    // Apple Music or radio playing: the background service carries on with the stream
+    char surl[400] = "";
+    if (S.game_music && audio_state() == A_PLAYING) {
+        if (radio_mode && !radio_paused) am_radio_url(radio_cur.id, surl, sizeof surl);
+        else if (am_mode && ams.playing) am_stream_url(surl, sizeof surl);
+    }
+    char sp[600];
+    path_join(sp, sizeof sp, data_dir, "bg_stream.txt");
+    unlink(sp);
+    if (surl[0]) {
+        FILE *f = fopen(sp, "w");
+        if (f) {
+            fprintf(f, "%s\n%s\n%s:%d\n%s\n", radio_mode ? "radio" : "apple", surl, ams.host, ams.port,
+                    radio_mode ? radio_cur.name : "Apple Music");
+            fclose(f);
+            handoff = 1;
+        }
+    }
     save_all();
-    if (am_mode) am_pause_now();   // nobody is listening any more
+    if (am_mode && !(handoff && surl[0])) am_pause_now();   // nobody is listening any more
     am_quit();
     audio_quit();
     pl_quit();

@@ -26,6 +26,7 @@
 #include "core.h"
 #include "audio.h"
 #include "playlist.h"
+#include "net.h"
 
 // ---------------------------------------------------------------- files
 static const char *libdir(void)
@@ -332,6 +333,75 @@ static void *direct_thread(void *arg)
     return NULL;
 }
 
+// ---------------------------------------------------------------- streams
+// Apple Music (Cider Bridge's stream) or a radio station handed over by MiniAmp
+// in data/bg_stream.txt: kind, url, host:port, name
+static int stream_mode;               // 0 = SD-card playlist, 1 = Apple Music, 2 = radio
+static char stream_url[400], stream_name[160], br_host[64];
+static int br_port;
+static int stream_paused;
+static uint32_t stream_retry_at, stream_started;
+static int stream_fails;
+
+static int load_stream(void)
+{
+    char p[600], kind[16] = "", hp[96] = "";
+    path_join(p, sizeof p, data_dir, "bg_stream.txt");
+    FILE *f = fopen(p, "r");
+    if (!f) return 0;
+    char *lines[4] = { kind, stream_url, hp, stream_name };
+    int sizes[4] = { sizeof kind, sizeof stream_url, sizeof hp, sizeof stream_name };
+    for (int i = 0; i < 4; i++) {
+        if (!fgets(lines[i], sizes[i], f)) lines[i][0] = 0;
+        lines[i][strcspn(lines[i], "\r\n")] = 0;
+    }
+    fclose(f);
+    unlink(p);
+    if (strncmp(stream_url, "http://", 7) != 0) return 0;
+    // the bridge's address, from the url
+    const char *h = stream_url + 7;
+    int n = (int)strcspn(h, ":/");
+    if (n <= 0 || n >= (int)sizeof br_host) return 0;
+    memcpy(br_host, h, n);
+    br_host[n] = 0;
+    br_port = h[n] == ':' ? atoi(h + n + 1) : 80;
+    return strcmp(kind, "radio") == 0 ? 2 : strcmp(kind, "apple") == 0 ? 1 : 0;
+}
+
+static void bridge_cmd(const char *name)
+{
+    char path[64];
+    snprintf(path, sizeof path, "/api/%s?fmt=text", name);
+    char *out = NULL;
+    int code = net_http(br_host, br_port, "POST", path, "{}", &out, NULL, 1500);
+    free(out);
+    if (code != 200) say("bridge didn't answer %s", name);
+}
+
+static void stream_connect(void)
+{
+    stream_retry_at = 0;
+    stream_paused = 0;
+    stream_started = now_ms();
+    audio_play_file(stream_url, 0, 0);
+}
+
+// SELECT+START while a stream plays
+static void stream_toggle(void)
+{
+    if (stream_paused) {
+        if (stream_mode == 1) bridge_cmd("play");
+        stream_connect();      // live: rejoin where the stream is now
+        say("SELECT+START: playing%s", "");
+    } else {
+        audio_stop();
+        stream_paused = 1;
+        stream_retry_at = 0;
+        if (stream_mode == 1) bridge_cmd("pause");
+        say("SELECT+START: paused%s", "");
+    }
+}
+
 // SELECT + L/R skip, + Up/Down volume, + START pause
 static void *input_thread(void *arg)
 {
@@ -351,6 +421,12 @@ static void *input_thread(void *arg)
         if (ev.code == 97) { select_down = ev.value != 0; continue; }
         if (!select_down || ev.value != 1) continue;
         pthread_mutex_lock(&act);
+        if (stream_mode && (ev.code == 18 || ev.code == 20 || ev.code == 28)) {
+            if (ev.code == 28) stream_toggle();
+            else if (stream_mode == 1) { bridge_cmd(ev.code == 18 ? "previous" : "next"); say(ev.code == 18 ? "SELECT+L: previous%s" : "SELECT+R: next%s", ""); }
+            pthread_mutex_unlock(&act);
+            continue;
+        }
         switch (ev.code) {
         case 18: core_skip(-1); say("SELECT+L: previous%s", ""); break;
         case 20: core_skip(1); say("SELECT+R: next%s", ""); break;
@@ -366,6 +442,7 @@ static void *input_thread(void *arg)
 
 static void save_place(void)
 {
+    if (stream_mode) return;   // the SD-card place stays as MiniAmp left it
     if (current >= 0) { S.cur_index = current; S.cur_pos_ms = audio_pos_ms(); }
     settings_save();
 }
@@ -400,10 +477,11 @@ int service_main(void)
     if (!S.game_music) { say("music in games is off%s", ""); unlink(p); return 0; }
     if (!gm_install()) say("could not set up the sound wrapper; music plays only when nothing else does%s", "");
 
+    stream_mode = load_stream();
     pl_init();
     path_join(p, sizeof p, data_dir, "playlist.m3u");
     pl_load_m3u(p);
-    if (S.cur_index < 0 || S.cur_index >= pl_count()) { say("nothing to play%s", ""); pid_path(p, sizeof p); unlink(p); return 0; }
+    if (!stream_mode && (S.cur_index < 0 || S.cur_index >= pl_count())) { say("nothing to play%s", ""); pid_path(p, sizeof p); unlink(p); return 0; }
 
     int sfd = open(BGM_SHM_PATH, O_RDWR | O_CREAT | O_TRUNC, 0666);
     if (sfd < 0 || ftruncate(sfd, sizeof(bgm_shm)) != 0) { say("shared memory failed%s", ""); return 1; }
@@ -418,9 +496,14 @@ int service_main(void)
 
     audio_init_ring(shm);
     core_apply_audio();
-    if (S.shuffle) core_build_shuffle();
-    core_play_index(S.cur_index, S.cur_pos_ms, 0);
-    say("playing %s", pl_path(S.cur_index));
+    if (stream_mode) {
+        stream_connect();
+        say(stream_mode == 1 ? "playing Apple Music (%s)" : "playing radio: %s", stream_name[0] ? stream_name : stream_url);
+    } else {
+        if (S.shuffle) core_build_shuffle();
+        core_play_index(S.cur_index, S.cur_pos_ms, 0);
+        say("playing %s", pl_path(S.cur_index));
+    }
 
     pthread_t th_direct, th_input;
     pthread_create(&th_direct, NULL, direct_thread, NULL);
@@ -431,12 +514,27 @@ int service_main(void)
     while (!svc_quit) {
         usleep(50000);
         pthread_mutex_lock(&act);
-        if (audio_take_finished()) {
+        if (stream_mode) {
+            // a live stream has no end: if it stops, reconnect (it never resumes, it rejoins live)
+            uint32_t tn = now_ms();
+            int fin = audio_take_finished(), err = audio_take_error();
+            if ((fin || err) && !stream_paused && !stream_retry_at) {
+                stream_fails = tn - stream_started < 10000 ? stream_fails + 1 : 0;
+                if (stream_fails >= 15) { say("the stream keeps failing - is Cider Bridge still running? Stopping.%s", ""); svc_quit = 1; }
+                else {
+                    say("stream dropped, reconnecting%s", "");
+                    stream_retry_at = tn + (stream_fails < 3 ? 2000 : 6000);
+                    if (!stream_retry_at) stream_retry_at = 1;
+                }
+            }
+            if (stream_retry_at && (int32_t)(tn - stream_retry_at) >= 0) stream_connect();
+        }
+        else if (audio_take_finished()) {
             errors = 0;
             if (!core_track_finished()) { say("end of the playlist%s", ""); svc_quit = 1; }
             else say("next: %s", pl_path(current));
         }
-        if (audio_take_error()) {
+        if (!stream_mode && audio_take_error()) {
             say("could not play %s", pl_path(current));
             if (++errors >= pl_count()) svc_quit = 1;
             else { int k = core_next_index(1); if (k >= 0) core_play_index(k, 0, 0); else svc_quit = 1; }
@@ -456,8 +554,13 @@ int service_main(void)
         }
     }
     pthread_mutex_lock(&act);
-    S.resume_playing = svc_signal && audio_state() == A_PLAYING;
-    save_place();
+    if (stream_mode) {
+        // MiniAmp opens on the SD-card playlist, paused; Cider has nobody listening now
+        if (stream_mode == 1 && !stream_paused) bridge_cmd("pause");
+    } else {
+        S.resume_playing = svc_signal && audio_state() == A_PLAYING;
+        save_place();
+    }
     pthread_mutex_unlock(&act);
     shm->magic = 0;
     __sync_synchronize();
