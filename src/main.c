@@ -286,6 +286,46 @@ static void radio_toggle(void)
     else { audio_stop(); radio_paused = 1; radio_retry_at = 0; }
 }
 
+static void am_begin(int wait_for_pc);
+
+// The background service was playing Apple Music or radio: pick it up again
+// (data/resume_stream.txt: "apple|radio paused")
+static void resume_stream(void)
+{
+    char p[600], kind[16] = "";
+    int paused = 0;
+    path_join(p, sizeof p, data_dir, "resume_stream.txt");
+    FILE *f = fopen(p, "r");
+    if (!f) return;
+    int ok = fscanf(f, "%15s %d", kind, &paused) >= 1;
+    fclose(f);
+    unlink(p);
+    if (!ok) return;
+    if (strcmp(kind, "apple") == 0) {
+        am_begin(0);                 // Cider kept playing (or stays paused, as it was)
+        return;
+    }
+    if (strcmp(kind, "radio") != 0) return;
+    path_join(p, sizeof p, data_dir, "radio_list.bin");
+    f = fopen(p, "rb");
+    if (!f) return;
+    int hdr[2] = { 0, 0 };
+    am_item *items = NULL;
+    if (fread(hdr, sizeof hdr, 1, f) == 1 && hdr[0] > 0 && hdr[0] < 10000 && hdr[1] >= 0 && hdr[1] < hdr[0]) {
+        items = malloc(sizeof *items * hdr[0]);
+        if (items && fread(items, sizeof *items, hdr[0], f) != (size_t)hdr[0]) { free(items); items = NULL; }
+    }
+    fclose(f);
+    if (!items) return;
+    for (int i = 0; i < hdr[0]; i++) {   // never trust strings read from disk to be terminated
+        items[i].id[sizeof items[i].id - 1] = 0;
+        items[i].name[sizeof items[i].name - 1] = 0;
+    }
+    radio_play_from(items, hdr[0], hdr[1]);
+    free(items);
+    if (paused) { audio_stop(); radio_paused = 1; radio_retry_at = 0; }
+}
+
 static void skip(int dir)
 {
     if (radio_mode) {
@@ -2164,6 +2204,7 @@ int main(int argc, char **argv)
         S.resume_playing = 0;
     }
     if (S.shuffle) build_shuffle();
+    resume_stream();
 
     double last = now();
     now_t = last;
@@ -2306,6 +2347,18 @@ int main(int argc, char **argv)
     char sp[600];
     path_join(sp, sizeof sp, data_dir, "bg_stream.txt");
     unlink(sp);
+    if (surl[0] && radio_mode) {
+        // the station list, so reopening MiniAmp comes back to the same station (and L/R still work)
+        char lp[600];
+        path_join(lp, sizeof lp, data_dir, "radio_list.bin");
+        FILE *lf = fopen(lp, "wb");
+        if (lf) {
+            int hdr[2] = { radio_n, radio_idx };
+            fwrite(hdr, sizeof hdr, 1, lf);
+            fwrite(radio_list, sizeof *radio_list, radio_n, lf);
+            fclose(lf);
+        }
+    }
     if (surl[0]) {
         FILE *f = fopen(sp, "w");
         if (f) {

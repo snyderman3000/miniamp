@@ -555,8 +555,14 @@ int service_main(void)
     }
     pthread_mutex_lock(&act);
     if (stream_mode) {
-        // MiniAmp opens on the SD-card playlist, paused; Cider has nobody listening now
-        if (stream_mode == 1 && !stream_paused) bridge_cmd("pause");
+        if (svc_signal) {
+            // MiniAmp is opening: it picks the stream up again (Cider keeps playing)
+            char rp[600];
+            path_join(rp, sizeof rp, data_dir, "resume_stream.txt");
+            FILE *rf = fopen(rp, "w");
+            if (rf) { fprintf(rf, "%s %d\n", stream_mode == 1 ? "apple" : "radio", stream_paused); fclose(rf); }
+        }
+        else if (stream_mode == 1 && !stream_paused) bridge_cmd("pause");   // nobody is listening any more
     } else {
         S.resume_playing = svc_signal && audio_state() == A_PLAYING;
         save_place();
